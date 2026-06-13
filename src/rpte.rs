@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 use rust_decimal::Decimal;
+use rust_decimal::RoundingStrategy;
 use crate::error::{Error, Result};
 use crate::node::{Node, Msg, Drt, OrderBookDepth, PairNode, OrderNode, AccountNode};
 use crate::token::Token;
@@ -186,8 +187,8 @@ impl Rpte {
             owner_node_id: src_id,
             src_token,
             dst_token,
-            volume,
-            price,
+            volume: self.round(volume),
+            price: self.round(price),
         });
     }
 
@@ -198,7 +199,7 @@ impl Rpte {
             owner_node_id: src_id,
             src_token,
             dst_token,
-            volume,
+            volume: self.round(volume),
         });
     }
 
@@ -208,7 +209,7 @@ impl Rpte {
             src_id,
             dst_id,
             token,
-            volume,
+            volume: self.round(volume),
             allow_negative: false,
         });
     }
@@ -219,7 +220,7 @@ impl Rpte {
             src_id,
             dst_id,
             token,
-            volume,
+            volume: self.round(volume),
             allow_negative: true,
         });
     }
@@ -274,10 +275,14 @@ impl Rpte {
 
         let is_forward = src_token == quote_token;
         let price = Decimal::ONE;
-        let pair = Pair::new(quote_token, base_token, price, self.max_tra_log_length);
+        let pair = Pair::new(quote_token, base_token, price, self.max_tra_log_length, self.precision);
         let pair_id = self.register_pair(pair);
         self.registered_token_pairs.insert((src_token, dst_token), pair_id);
         (pair_id, is_forward)
+    }
+
+    fn round(&self, value: Decimal) -> Decimal {
+        value.round_dp_with_strategy(self.precision as u32, RoundingStrategy::ToZero)
     }
 
     /// 发行资产到指定节点
@@ -288,6 +293,7 @@ impl Rpte {
         if !self.token_id_to_name.contains_key(&token) {
             return Err(Error::TokenNotRegistered(token));
         }
+        let volume = self.round(volume);
         self.nodes[node_id].adjust_balance(token, volume);
         Ok(())
     }
@@ -367,23 +373,31 @@ impl Rpte {
             return Ok(());
         }
 
-        // 读出 owner_id 和 pair_id
-        let (owner_id, pair_id) = {
+        // 读出 owner_id、pair_id、订单类型和状态
+        let (owner_id, pair_id, is_swap, is_open) = {
             let order = self.get_order_node(order_id)?;
-            (order.get_owner_node_id(), order.get_pair_node_id())
+            (
+                order.get_owner_node_id(),
+                order.get_pair_node_id(),
+                order.get_order_type() == &OrderType::Swap,
+                OrderNode::is_open(order),
+            )
         };
 
-        // 构建 brief（内部已校验 pair_id 有效性）
-        let brief = self.get_order_brief(order_id)?;
-
-        // 更新 Pair 订单簿
-        if let Ok(pair) = self.get_pair_node(pair_id) {
-            pair.update_brief(brief.clone());
+        // 更新 Pair 订单簿（仅限已开启的限价单）
+        if is_open && !is_swap {
+            let brief = self.get_order_brief(order_id)?;
+            if let Ok(pair) = self.get_pair_node(pair_id) {
+                pair.update_brief(brief.clone());
+            }
         }
 
-        // 向 Owner Account 转发 brief（如果 owner 是 AccountNode）
-        if let Ok(account) = self.get_account_node(owner_id) {
-            account.update_order_brief(&brief);
+        // 向 Owner Account 转发 brief（无论是否开启）
+        if is_open {
+            let brief = self.get_order_brief(order_id)?;
+            if let Ok(account) = self.get_account_node(owner_id) {
+                account.update_order_brief(&brief);
+            }
         }
 
         Ok(())
@@ -452,9 +466,15 @@ impl Rpte {
                     if let Err(e) = self._transfer(src_id, new_order_id, src_token, volume, false) {
                         eprintln!("WARNING: OpenOrder transfer failed: {e}");
                     }
-                    // 自动触发 Pair 订单簿更新 + 撮合
-                    if let Err(e) = self._update_order_for_pairs(new_order_id) {
-                        eprintln!("WARNING: OpenOrder update_order_for_pairs failed: {e}");
+                    // 插入订单簿并触发撮合
+                    if let Ok(brief) = self.get_order_brief(new_order_id) {
+                        if let Ok(pair) = self.get_pair_node(pair_node_id) {
+                            pair.insert_brief(brief.clone());
+                        }
+                        // 向 Owner Account 转发 brief
+                        if let Ok(account) = self.get_account_node(owner_node_id) {
+                            account.update_order_brief(&brief);
+                        }
                     }
                 }
                 Msg::SwapOrder { src_id, owner_node_id, src_token, dst_token, volume } => {
@@ -566,6 +586,7 @@ impl Rpte {
     }
 
     fn _transfer(&mut self, src_id: usize, dst_id: usize, token: usize, volume: Decimal, allow_negative: bool) -> Result<()> {
+        let volume = self.round(volume);
         if !self.token_id_to_name.contains_key(&token) {
             return Err(Error::TokenNotRegistered(token));
         }

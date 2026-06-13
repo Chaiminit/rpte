@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use rust_decimal::Decimal;
+use rust_decimal::RoundingStrategy;
 use crate::node::{Node, Msg, Drt, PairNode, OrderBookDepth};
 use crate::order::OrderBrief;
 use crate::order_book::OrderBook;
@@ -36,6 +37,7 @@ pub struct Pair {
     price: Decimal,
     step_count: u64,
     max_tra_log_length: usize,
+    precision: u8,
 
     order_book: OrderBook,
     tra_logs: VecDeque<TraLog>,
@@ -43,7 +45,7 @@ pub struct Pair {
 
 
 impl Pair {
-    pub fn new(quote_token: usize, base_token: usize, price: Decimal, max_tra_log_length: usize) -> Self {
+    pub fn new(quote_token: usize, base_token: usize, price: Decimal, max_tra_log_length: usize, precision: u8) -> Self {
         Self {
             id: 0,
             sheet: HashMap::new(),
@@ -51,11 +53,16 @@ impl Pair {
             tra_logs: VecDeque::new(),
             step_count: 0,
             max_tra_log_length,
+            precision,
             quote_token,
             base_token,
             price,
             order_book: OrderBook::new(),
         }
+    }
+
+    fn round(&self, value: Decimal) -> Decimal {
+        value.round_dp_with_strategy(self.precision as u32, RoundingStrategy::ToZero)
     }
 }
 
@@ -210,16 +217,15 @@ impl PairNode for Pair {
     }
 
     fn update_brief(&mut self, brief: OrderBrief) {
-        // 更新数量（两遍处理保证此时余额已准确）
+        // 仅更新已在订单簿中的订单（余额变化通过 Transfer 同步）
         if self.order_book.contains(brief.id) {
             self.order_book.update_volume(brief.id, brief.src_volume, brief.dst_volume);
-            return;
         }
+    }
 
-        // 插入新订单
+    fn insert_brief(&mut self, brief: OrderBrief) {
+        // 新订单插入订单簿并触发撮合
         self.order_book.insert(&brief);
-
-        // 触发撮合
         self.match_orders();
     }
 
@@ -268,7 +274,7 @@ impl PairNode for Pair {
             };
 
             let match_base_volume = (buy.src_volume / match_price).min(sell.src_volume);
-            let match_quote_volume = match_base_volume * match_price;
+            let match_quote_volume = (match_base_volume * match_price).min(buy.src_volume);
 
             // 发消息让 Engine 执行转账
             self.send_msg(Msg::Transfer {
@@ -286,7 +292,7 @@ impl PairNode for Pair {
                 allow_negative: false,
             });
 
-            self.push_tra_log(self.step_count, buy.id, sell.id, match_price, match_base_volume);
+            self.push_tra_log(self.step_count, buy.id, sell.id, self.round(match_price), match_base_volume);
 
             // 计算剩余量 (use updated values from the cloned briefs)
             let buy_remaining = buy.src_volume - match_quote_volume;
@@ -317,7 +323,7 @@ impl PairNode for Pair {
             }
         }
 
-        self.price = match_price;
+        self.price = self.round(match_price);
     }
 
     fn process_swap(&mut self, swap_id: usize, direction: Drt, volume: Decimal) {

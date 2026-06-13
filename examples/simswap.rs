@@ -94,8 +94,7 @@ fn main() {
         bot_manager.add_bot(account);
     }
 
-    for _i in 0..10 {
-        rpte.step();
+    for _i in 0..1000 {
         rpte.step();
         bot_manager.step(&mut rpte);
         let (price, _, _) = rpte.get_current_price(btc_token, usdt_token).unwrap();

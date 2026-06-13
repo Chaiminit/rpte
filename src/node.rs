@@ -73,6 +73,7 @@ pub trait PairNode: Node {
     fn latest_candle(&self, interval: u64) -> Option<CandleData>;
     fn push_tra_log(&mut self, step_count: u64, src_id: usize, dst_id: usize, price: Decimal, volume: Decimal);
     fn update_brief(&mut self, brief: OrderBrief);
+    fn insert_brief(&mut self, brief: OrderBrief);
     fn cancel_brief(&mut self, id: usize);
     fn match_orders(&mut self);
     fn process_swap(&mut self, swap_id: usize, direction: Drt, volume: Decimal);
