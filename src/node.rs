@@ -76,12 +76,9 @@ pub trait PairNode: Node {
     fn insert_brief(&mut self, brief: OrderBrief);
     fn cancel_brief(&mut self, id: usize);
     fn match_orders(&mut self);
-    fn process_swap(
-        &mut self,
-        user_id: usize,
-        direction: Drt,
-        volume: Decimal,
-    );
+    /// 市价单直接撮合，不创建临时订单节点。
+    /// 返回 (转账指令列表, 需关闭的订单ID列表)，引擎在同一帧执行。
+    fn process_swap(&mut self, owner_id: usize, direction: Drt, volume: Decimal) -> (Vec<SwapTransfer>, Vec<usize>);
 }
 
 
@@ -97,6 +94,15 @@ pub trait AccountNode: Node {
 pub enum Drt {
     Buy,
     Sell,
+}
+
+/// 撮合生成的单笔转账指令（引擎直接执行，不入消息队列）
+#[derive(Debug, Clone)]
+pub struct SwapTransfer {
+    pub src_id: usize,
+    pub dst_id: usize,
+    pub token: usize,
+    pub volume: Decimal,
 }
 
 /// 订单簿深度快照
