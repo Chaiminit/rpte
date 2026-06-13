@@ -33,7 +33,7 @@ impl RandomBotManager {
         Self {
             tokens: Vec::new(),
             bots: Vec::new(),
-            max_order_ratio: 10,
+            max_order_ratio: 2,
         }
     }
 
@@ -54,7 +54,7 @@ impl RandomBotManager {
             // 当订单数达到上限时，随机关闭当前 bot 的一个订单
             let cancel_target = rpte.get_account_orders(*bot).ok().and_then(|order_set| {
                 let ids: Vec<usize> = order_set.iter().copied().collect();
-                if ids.len() >= self.max_order_ratio * self.bots.len() {
+                if ids.len() >= self.max_order_ratio {
                     Some(ids[rng.gen_range(0..ids.len())])
                 } else {
                     None
@@ -62,6 +62,7 @@ impl RandomBotManager {
             });
             if let Some(order_id) = cancel_target {
                 rpte.cancel_order(order_id);
+                println!("cancel order: {}", order_id);
             }
 
             let src_token = self.tokens[rng.gen_range(0..self.tokens.len())];
@@ -75,10 +76,13 @@ impl RandomBotManager {
             let (pair_price, quote, _base) = rpte.get_current_price(src_token, dst_token).unwrap();
 
             let volume = amount_ratio * rpte.get_node_balance(*bot, src_token).unwrap();
+            if volume.is_zero() {
+                continue;
+            }
             let price = if src_token == quote {
-                pair_price * (Decimal::ONE + price_ratio)
-            } else {
                 pair_price * (Decimal::ONE - price_ratio)
+            } else {
+                pair_price * (Decimal::ONE + price_ratio)
             };
 
             if is_swap {
@@ -112,6 +116,12 @@ fn main() {
         bot_manager.step(engine);
         let (price, _, _) = engine.get_current_price(btc_token, usdt_token).unwrap();
         println!("btc price: {}", price);
+        let order_book = engine.get_order_book(usdt_token, btc_token, 1).unwrap();
+        println!("order book: {:?}", order_book);
+        let a_bot_usdt = engine.get_node_balance(bot_manager.bots[0], usdt_token).unwrap();
+        println!("a bot usdt: {}", a_bot_usdt);
+        let a_bot_btc = engine.get_node_balance(bot_manager.bots[0], btc_token).unwrap();
+        println!("a bot btc: {}", a_bot_btc);
 
         step_count += 1;
         if step_count >= 1000 {

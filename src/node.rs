@@ -76,7 +76,12 @@ pub trait PairNode: Node {
     fn insert_brief(&mut self, brief: OrderBrief);
     fn cancel_brief(&mut self, id: usize);
     fn match_orders(&mut self);
-    fn process_swap(&mut self, swap_id: usize, direction: Drt, volume: Decimal);
+    fn process_swap(
+        &mut self,
+        user_id: usize,
+        direction: Drt,
+        volume: Decimal,
+    );
 }
 
 

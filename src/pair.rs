@@ -326,11 +326,17 @@ impl PairNode for Pair {
         self.price = self.round(match_price);
     }
 
-    fn process_swap(&mut self, swap_id: usize, direction: Drt, volume: Decimal) {
+    /// 市价单直接撮合（同步完成，不创建临时订单节点，不产生跨帧消息）
+    /// `transfer` 闭包由引擎提供，执行即时余额划转
+    fn process_swap(
+        &mut self,
+        user_id: usize,
+        direction: Drt,
+        volume: Decimal,
+    ) {
         let eps = Decimal::new(1, 12); // 1e-12
 
         if direction == Drt::Buy {
-            // Swap Buy: 花费 quote_token 买入 base_token，匹配卖单队列
             let mut remaining = volume; // quote_token
 
             while remaining > eps {
@@ -340,7 +346,6 @@ impl PairNode for Pair {
                     None => break,
                 };
 
-                // 跳过零价格卖单
                 if sell.price <= eps {
                     self.send_msg(Msg::CloseOrder { order_id: sell.id });
                     self.order_book.cancel(sell.id);
@@ -350,9 +355,16 @@ impl PairNode for Pair {
                 let max_base = remaining / sell.price;
                 let match_base = max_base.min(sell.src_volume);
                 let match_quote = (match_base * sell.price).min(remaining);
+                let match_quote = self.round(match_quote);
+                let match_base = self.round(match_base);
+
+                // 精度不足，无法进一步成交
+                if match_quote.is_zero() || match_base.is_zero() {
+                    break;
+                }
 
                 self.send_msg(Msg::Transfer {
-                    src_id: swap_id,
+                    src_id: user_id,
                     dst_id: sell.id,
                     token: self.quote_token,
                     volume: match_quote,
@@ -360,13 +372,14 @@ impl PairNode for Pair {
                 });
                 self.send_msg(Msg::Transfer {
                     src_id: sell.id,
-                    dst_id: swap_id,
+                    dst_id: user_id,
                     token: self.base_token,
                     volume: match_base,
                     allow_negative: false,
                 });
 
-                self.push_tra_log(self.step_count, swap_id, sell.id, sell.price, match_base);
+                self.push_tra_log(self.step_count, user_id, sell.id, sell.price, match_base);
+                self.price = sell.price;
 
                 remaining -= match_quote;
 
@@ -375,11 +388,10 @@ impl PairNode for Pair {
                     self.send_msg(Msg::CloseOrder { order_id: sell.id });
                     self.order_book.cancel(sell.id);
                 } else {
-                    self.order_book.update_volume(sell.id, sell_remaining, sell.dst_volume);
+                    self.order_book.update_volume(sell.id, sell_remaining, sell.dst_volume + match_quote);
                 }
             }
         } else {
-            // Swap Sell: 卖出 base_token 换取 quote_token，匹配买单队列
             let mut remaining = volume; // base_token
 
             while remaining > eps {
@@ -389,7 +401,6 @@ impl PairNode for Pair {
                     None => break,
                 };
 
-                // 跳过零价格买单
                 if buy.price <= eps {
                     self.send_msg(Msg::CloseOrder { order_id: buy.id });
                     self.order_book.cancel(buy.id);
@@ -400,9 +411,16 @@ impl PairNode for Pair {
                 let max_base = max_quote / buy.price;
                 let match_base = max_base.min(remaining);
                 let match_quote = (match_base * buy.price).min(max_quote);
+                let match_quote = self.round(match_quote);
+                let match_base = self.round(match_base);
+
+                // 精度不足，无法进一步成交
+                if match_quote.is_zero() || match_base.is_zero() {
+                    break;
+                }
 
                 self.send_msg(Msg::Transfer {
-                    src_id: swap_id,
+                    src_id: user_id,
                     dst_id: buy.id,
                     token: self.base_token,
                     volume: match_base,
@@ -410,13 +428,14 @@ impl PairNode for Pair {
                 });
                 self.send_msg(Msg::Transfer {
                     src_id: buy.id,
-                    dst_id: swap_id,
+                    dst_id: user_id,
                     token: self.quote_token,
                     volume: match_quote,
                     allow_negative: false,
                 });
 
-                self.push_tra_log(self.step_count, buy.id, swap_id, buy.price, match_base);
+                self.push_tra_log(self.step_count, buy.id, user_id, buy.price, match_base);
+                self.price = buy.price;
 
                 remaining -= match_base;
 
@@ -425,12 +444,9 @@ impl PairNode for Pair {
                     self.send_msg(Msg::CloseOrder { order_id: buy.id });
                     self.order_book.cancel(buy.id);
                 } else {
-                    self.order_book.update_volume(buy.id, buy_remaining, buy.dst_volume);
+                    self.order_book.update_volume(buy.id, buy_remaining, buy.dst_volume + match_base);
                 }
             }
         }
-
-        // 市价单不留订单簿，直接关闭退回剩余资金
-        self.send_msg(Msg::CloseOrder { order_id: swap_id });
     }
 }
