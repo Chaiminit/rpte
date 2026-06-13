@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 use rust_decimal::Decimal;
 use crate::order::{OrderBrief, OrderType};
@@ -81,10 +81,10 @@ pub trait PairNode: Node {
 
 
 pub trait AccountNode: Node {
-    fn update_order_brief(&mut self, brief: &OrderBrief);
-    fn remove_order_brief(&mut self, order_id: usize);
+    fn insert_order(&mut self, order_id: usize);
+    fn remove_order(&mut self, order_id: usize);
+    fn get_orders(&self) -> &HashSet<usize>;
 }
-
 
 
 

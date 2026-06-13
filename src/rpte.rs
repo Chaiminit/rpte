@@ -181,52 +181,57 @@ impl Rpte {
     // ========== 账户操作代理方法 ==========
 
     /// 创建限价单
-    pub fn make(&mut self, src_id: usize, src_token: usize, dst_token: usize, volume: Decimal, price: Decimal) {
+    pub fn make(&mut self, src_id: usize, src_token: usize, dst_token: usize, volume: impl Into<Decimal>, price: impl Into<Decimal>) {
+        let volume = self.round(volume.into());
+        let price = self.round(price.into());
         self.msgs.push(Msg::OpenOrder {
             src_id,
             owner_node_id: src_id,
             src_token,
             dst_token,
-            volume: self.round(volume),
-            price: self.round(price),
+            volume,
+            price,
         });
     }
 
     /// 创建市价单
-    pub fn swap(&mut self, src_id: usize, src_token: usize, dst_token: usize, volume: Decimal) {
+    pub fn swap(&mut self, src_id: usize, src_token: usize, dst_token: usize, volume: impl Into<Decimal>) {
+        let volume = self.round(volume.into());
         self.msgs.push(Msg::SwapOrder {
             src_id,
             owner_node_id: src_id,
             src_token,
             dst_token,
-            volume: self.round(volume),
+            volume,
         });
     }
 
     /// 转账（默认严格模式：余额不足时报错）
-    pub fn transfer(&mut self, src_id: usize, dst_id: usize, token: usize, volume: Decimal) {
+    pub fn transfer(&mut self, src_id: usize, dst_id: usize, token: usize, volume: impl Into<Decimal>) {
+        let volume = self.round(volume.into());
         self.msgs.push(Msg::Transfer {
             src_id,
             dst_id,
             token,
-            volume: self.round(volume),
+            volume,
             allow_negative: false,
         });
     }
 
     /// 允许透支的转账（余额不足时余额变负）
-    pub fn transfer_with_overdraft(&mut self, src_id: usize, dst_id: usize, token: usize, volume: Decimal) {
+    pub fn transfer_with_overdraft(&mut self, src_id: usize, dst_id: usize, token: usize, volume: impl Into<Decimal>) {
+        let volume = self.round(volume.into());
         self.msgs.push(Msg::Transfer {
             src_id,
             dst_id,
             token,
-            volume: self.round(volume),
+            volume,
             allow_negative: true,
         });
     }
 
     /// 取消订单
-    pub fn cancel(&mut self, order_id: usize) {
+    pub fn cancel_order(&mut self, order_id: usize) {
         self.msgs.push(Msg::CloseOrder { order_id });
     }
 
@@ -286,14 +291,14 @@ impl Rpte {
     }
 
     /// 发行资产到指定节点
-    pub fn issue(&mut self, node_id: usize, token: usize, volume: Decimal) -> Result<()> {
+    pub fn issue(&mut self, node_id: usize, token: usize, volume: impl Into<Decimal>) -> Result<()> {
         if node_id >= self.nodes.len() {
             return Err(Error::NodeNotFound { id: node_id, len: self.nodes.len() });
         }
         if !self.token_id_to_name.contains_key(&token) {
             return Err(Error::TokenNotRegistered(token));
         }
-        let volume = self.round(volume);
+        let volume = self.round(volume.into());
         self.nodes[node_id].adjust_balance(token, volume);
         Ok(())
     }
@@ -307,6 +312,11 @@ impl Rpte {
             self.registered_orders.insert(order_id);
             order_id
         }
+    }
+
+    pub fn get_account_orders(&mut self, account_id: usize) -> Result<&HashSet<usize>> {
+        let account = self.get_account_node(account_id)?;
+        Ok(account.get_orders())
     }
 
     pub fn get_order_brief(&mut self, order_id: usize) -> Result<OrderBrief> {
@@ -392,12 +402,9 @@ impl Rpte {
             }
         }
 
-        // 向 Owner Account 转发 brief（无论是否开启）
-        if is_open {
-            let brief = self.get_order_brief(order_id)?;
-            if let Ok(account) = self.get_account_node(owner_id) {
-                account.update_order_brief(&brief);
-            }
+        // 更新 Account 订单簿
+        if let Ok(account) = self.get_account_node(owner_id) {
+            account.insert_order(order_id);
         }
 
         Ok(())
@@ -473,7 +480,7 @@ impl Rpte {
                         }
                         // 向 Owner Account 转发 brief
                         if let Ok(account) = self.get_account_node(owner_node_id) {
-                            account.update_order_brief(&brief);
+                            account.insert_order(new_order_id);
                         }
                     }
                 }
@@ -551,10 +558,11 @@ impl Rpte {
                         Ok(p) => p.cancel_brief(order_id),
                         Err(e) => eprintln!("ERROR: CloseOrder: {e}"),
                     }
-                    // 通知 Owner Account 删除订单摘要
+                    // 更新 Account 订单簿
                     if let Ok(account) = self.get_account_node(owner_id) {
-                        account.remove_order_brief(order_id);
+                        account.remove_order(order_id);
                     }
+
                     self.return_order(order_id);
                 }
             }

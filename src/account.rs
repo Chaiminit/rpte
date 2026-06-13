@@ -9,32 +9,6 @@ pub struct Account {
     msgs: Vec<Msg>,
     sheet: HashMap<usize, Decimal>,
     order_ids: HashSet<usize>,
-    orders_briefs: HashMap<usize, OrderBrief>,
-}
-
-
-impl Account {
-    pub fn new() -> Self {
-        Self {
-            id: 0,
-            msgs: Vec::new(),
-            sheet: HashMap::new(),
-            order_ids: HashSet::new(),
-            orders_briefs: HashMap::new(),
-        }
-    }
-
-    pub fn get_orders(&self) -> &HashSet<usize> {
-        &self.order_ids
-    }
-
-    pub fn get_order_brief(&self, order_id: usize) -> Option<&OrderBrief> {
-        self.orders_briefs.get(&order_id)
-    }
-
-    pub fn get_all_order_briefs(&self) -> &HashMap<usize, OrderBrief> {
-        &self.orders_briefs
-    }
 }
 
 
@@ -61,13 +35,27 @@ impl Node for Account {
     }
 }
 
-impl AccountNode for Account {
-    fn update_order_brief(&mut self, brief: &OrderBrief) {
-        self.orders_briefs.insert(brief.id, brief.clone());
-    }
 
-    fn remove_order_brief(&mut self, order_id: usize) {
-        self.orders_briefs.remove(&order_id);
+impl AccountNode for Account {
+    fn insert_order(&mut self, order_id: usize) {
+        self.order_ids.insert(order_id);
+    }
+    fn remove_order(&mut self, order_id: usize) {
         self.order_ids.remove(&order_id);
+    }
+    fn get_orders(&self) -> &HashSet<usize> {
+        &self.order_ids
+    }
+}
+
+
+impl Account {
+    pub fn new() -> Self {
+        Self {
+            id: 0,
+            msgs: Vec::new(),
+            sheet: HashMap::new(),
+            order_ids: HashSet::new(),
+        }
     }
 }

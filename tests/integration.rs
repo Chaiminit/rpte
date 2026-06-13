@@ -76,7 +76,7 @@ fn test_issue() {
 fn test_issue_to_nonexistent_node() {
     let mut engine = Rpte::new("USDT", 4);
     let usdt = engine.get_token_by_name("USDT").unwrap();
-    let result = engine.issue(999, usdt, Decimal::new(100, 0));
+    let result = engine.issue(999, usdt, 100u64);
     assert!(result.is_err());
 }
 
@@ -99,13 +99,13 @@ fn test_transfer() {
     let usdt = engine.get_token_by_name("USDT").unwrap();
     let alice = engine.register_account();
     let bob = engine.register_account();
-    engine.issue(alice, usdt, Decimal::new(10000, 0)).unwrap();
+    engine.issue(alice, usdt, 10000u64).unwrap();
 
-    engine.transfer(alice, bob, usdt, Decimal::new(3000, 0));
+    engine.transfer(alice, bob, usdt, 3000u64);
     engine.step();
 
-    assert_eq!(engine.get_node_balance(alice, usdt).unwrap(), Decimal::new(7000, 0));
-    assert_eq!(engine.get_node_balance(bob, usdt).unwrap(), Decimal::new(3000, 0));
+    assert_eq!(engine.get_node_balance(alice, usdt).unwrap(), Decimal::from(7000u64));
+    assert_eq!(engine.get_node_balance(bob, usdt).unwrap(), Decimal::from(3000u64));
 }
 
 #[test]
@@ -113,9 +113,9 @@ fn test_transfer_self() {
     let mut engine = Rpte::new("USDT", 4);
     let usdt = engine.get_token_by_name("USDT").unwrap();
     let alice = engine.register_account();
-    engine.issue(alice, usdt, Decimal::new(5000, 0)).unwrap();
+    engine.issue(alice, usdt, 5000u64).unwrap();
 
-    engine.transfer(alice, alice, usdt, Decimal::new(1000, 0));
+    engine.transfer(alice, alice, usdt, 1000u64);
     engine.step();
 
     // 自我转账应无影响
@@ -133,8 +133,8 @@ fn test_make_order() {
     let btc = engine.register_token("BTC");
     let alice = engine.register_account();
 
-    engine.issue(alice, usdt, Decimal::new(10000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(5000, 0), Decimal::new(50000, 0));
+    engine.issue(alice, usdt, 10000u64).unwrap();
+    engine.make(alice, usdt, btc, 5000u64, 50000u64);
     engine.step();
 
     // 检查订单是否创建
@@ -151,13 +151,13 @@ fn test_make_and_match() {
     let bob = engine.register_account();
 
     // Alice 以 50000 USDT/BTC 挂买单
-    engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.issue(alice, usdt, 50000u64).unwrap();
+    engine.make(alice, usdt, btc, 50000u64, 50000u64);
     engine.step();
 
     // Bob 以 50000 USDT/BTC 挂卖单
-    engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.issue(bob, btc, 1u64).unwrap();
+    engine.make(bob, btc, usdt, 1u64, 50000u64);
     engine.step();
 
     // 再驱动一帧处理撮合产生的转账和关单消息
@@ -177,13 +177,13 @@ fn test_make_partial_fill() {
     let bob = engine.register_account();
 
     // Alice 以 50000 挂买单，买入 1 BTC
-    engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.issue(alice, usdt, 50000u64).unwrap();
+    engine.make(alice, usdt, btc, 50000u64, 50000u64);
     engine.step();
 
     // Bob 以 50000 挂卖单，只卖 0.5 BTC
-    engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.issue(bob, btc, 1u64).unwrap();
+    engine.make(bob, btc, usdt, 1u64, 50000u64);
     engine.step();
 
     // 再驱动一帧处理撮合消息
@@ -205,15 +205,15 @@ fn test_make_price_priority() {
     let charlie = engine.register_account();
 
     // 两个买单：Alice 出价 40000, Bob 出价 50000（更高）
-    engine.issue(alice, usdt, Decimal::new(40000, 0)).unwrap();
-    engine.issue(bob, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(40000, 0), Decimal::new(40000, 0));
-    engine.make(bob, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.issue(alice, usdt, 40000u64).unwrap();
+    engine.issue(bob, usdt, 50000u64).unwrap();
+    engine.make(alice, usdt, btc, 40000u64, 40000u64);
+    engine.make(bob, usdt, btc, 50000u64, 50000u64);
     engine.step();
 
     // Charlie 以 45000 卖 1 BTC
-    engine.issue(charlie, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(charlie, btc, usdt, Decimal::new(1, 0), Decimal::new(45000, 0));
+    engine.issue(charlie, btc, 1u64).unwrap();
+    engine.make(charlie, btc, usdt, 1u64, 45000u64);
     engine.step();
 
     // 再驱动一帧处理撮合消息
@@ -312,7 +312,7 @@ fn test_cancel_order() {
     let order_id = orders[0];
 
     // 取消订单
-    engine.cancel(order_id);
+    engine.cancel_order(order_id);
     engine.step();
 
     // 资金应退回

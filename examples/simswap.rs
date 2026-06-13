@@ -7,12 +7,12 @@ pub fn random_bot() -> (bool, Decimal, Decimal) {
     let mut rng = rand::thread_rng();
     let d: f64 = rng.gen_range(0.0..=1.0);
     if d <= 0.2 {
-        let amount_ratio: f64 = rng.gen_range(0.05..=0.95);
+        let amount_ratio: f64 = rng.gen_range(0.05..=0.5);
         let amount_ratio = amount_ratio.powf(2.5);
         let price_ratio = Decimal::ZERO;
         return (true, Decimal::from_f64(amount_ratio).unwrap(), price_ratio);
     } else {
-        let amount_ratio: f64 = rng.gen_range(0.05..=0.95);
+        let amount_ratio: f64 = rng.gen_range(0.1..=0.95);
         let amount_ratio = amount_ratio.powf(2.0);
         let price_ratio: f64 = rng.gen_range(0.0..0.9);
         let price_ratio = price_ratio.powf(3.0);
@@ -51,6 +51,19 @@ impl RandomBotManager {
         }
         let mut rng = rand::thread_rng();
         for bot in &self.bots {
+            // 当订单数达到上限时，随机关闭当前 bot 的一个订单
+            let cancel_target = rpte.get_account_orders(*bot).ok().and_then(|order_set| {
+                let ids: Vec<usize> = order_set.iter().copied().collect();
+                if ids.len() >= self.max_order_num {
+                    Some(ids[rng.gen_range(0..ids.len())])
+                } else {
+                    None
+                }
+            });
+            if let Some(order_id) = cancel_target {
+                rpte.cancel_order(order_id);
+            }
+
             let src_token = self.tokens[rng.gen_range(0..self.tokens.len())];
             let dst_token = loop {
                 let dst = self.tokens[rng.gen_range(0..self.tokens.len())];
@@ -89,8 +102,8 @@ fn main() {
 
     for _i in 0..50 {
         let account = rpte.register_account();
-        let _ = rpte.issue(account, usdt_token, Decimal::new(10000, 0));
-        let _ = rpte.issue(account, btc_token, Decimal::new(1, 0));
+        let _ = rpte.issue(account, usdt_token, 10000u64);
+        let _ = rpte.issue(account, btc_token, 1u64);
         bot_manager.add_bot(account);
     }
 

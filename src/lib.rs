@@ -27,11 +27,11 @@
 //! let alice = engine.register_account();
 //!
 //! // Issue assets
-//! engine.issue(alice, usdt, Decimal::new(10000, 0)).unwrap();
-//! engine.issue(alice, btc, Decimal::new(10, 0)).unwrap();
+//! engine.issue(alice, usdt, 10000u64).unwrap();
+//! engine.issue(alice, btc, 10u64).unwrap();
 //!
 //! // Create a limit buy order
-//! engine.make(alice, usdt, btc, Decimal::new(5000, 0), Decimal::new(50000, 0));
+//! engine.make(alice, usdt, btc, 5000u64, 50000u64);
 //! engine.step(); // Drive one frame
 //!
 //! // Query balance
