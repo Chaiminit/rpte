@@ -12,3 +12,6 @@ readme = "README.md"
 [dependencies]
 rust_decimal = "1.36"
 chrono = "0.4"
+
+[dev-dependencies]
+rand = "0.8"

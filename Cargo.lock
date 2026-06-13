@@ -439,6 +439,7 @@ name = "rpte"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "rand",
  "rust_decimal",
 ]
 
