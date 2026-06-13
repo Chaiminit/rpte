@@ -68,12 +68,16 @@ impl Rpte {
     }
 
     /// 以固定帧率运行引擎循环，直到调用 stop()
-    pub fn run(&mut self, fps: u64) {
+    pub fn run<F>(&mut self, fps: u64, mut callback: F)
+    where
+        F: FnMut(&mut Self)
+    {
         assert!(fps > 0, "run: fps must be > 0");
         let frame_duration = std::time::Duration::from_secs_f64(1.0 / fps as f64);
         while self.running {
             let start = std::time::Instant::now();
             self.step();
+            callback(self);
             let elapsed = start.elapsed();
             if elapsed < frame_duration {
                 std::thread::sleep(frame_duration - elapsed);

@@ -24,7 +24,7 @@ pub fn random_bot() -> (bool, Decimal, Decimal) {
 pub struct RandomBotManager {
     tokens: Vec<usize>,
     bots: Vec<usize>,
-    max_order_num: usize,
+    max_order_ratio: usize,
 }
 
 
@@ -33,7 +33,7 @@ impl RandomBotManager {
         Self {
             tokens: Vec::new(),
             bots: Vec::new(),
-            max_order_num: 1000,
+            max_order_ratio: 10,
         }
     }
 
@@ -54,7 +54,7 @@ impl RandomBotManager {
             // 当订单数达到上限时，随机关闭当前 bot 的一个订单
             let cancel_target = rpte.get_account_orders(*bot).ok().and_then(|order_set| {
                 let ids: Vec<usize> = order_set.iter().copied().collect();
-                if ids.len() >= self.max_order_num {
+                if ids.len() >= self.max_order_ratio * self.bots.len() {
                     Some(ids[rng.gen_range(0..ids.len())])
                 } else {
                     None
@@ -100,17 +100,22 @@ fn main() {
     bot_manager.add_token(btc_token);
     bot_manager.add_token(usdt_token);
 
-    for _i in 0..50 {
+    for _i in 0..200 {
         let account = rpte.register_account();
-        let _ = rpte.issue(account, usdt_token, 10000u64);
+        let _ = rpte.issue(account, usdt_token, 100000u64);
         let _ = rpte.issue(account, btc_token, 1u64);
         bot_manager.add_bot(account);
     }
 
-    for _i in 0..1000 {
-        rpte.step();
-        bot_manager.step(&mut rpte);
-        let (price, _, _) = rpte.get_current_price(btc_token, usdt_token).unwrap();
+    let mut step_count = 0u64;
+    rpte.run(100, |engine| {
+        bot_manager.step(engine);
+        let (price, _, _) = engine.get_current_price(btc_token, usdt_token).unwrap();
         println!("btc price: {}", price);
-    }
+
+        step_count += 1;
+        if step_count >= 1000 {
+            engine.stop();
+        }
+    });
 }
