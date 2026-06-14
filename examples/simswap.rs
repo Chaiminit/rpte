@@ -103,9 +103,9 @@ fn main() {
     bot_manager.add_token(btc_token);
     bot_manager.add_token(usdt_token);
 
-    for _i in 0..200 {
+    for _i in 0..100 {
         let account = rpte.register_account();
-        let _ = rpte.issue(account, usdt_token, 100000u64);
+        let _ = rpte.issue(account, usdt_token, 1u64);
         let _ = rpte.issue(account, btc_token, 1u64);
         bot_manager.add_bot(account);
     }
@@ -117,9 +117,9 @@ fn main() {
         println!("btc price: {}", price);
         // let order_book = engine.get_order_book(usdt_token, btc_token, 1).unwrap();
         // println!("order book: {:?}", order_book);
-        // let a_bot_usdt = engine.get_node_balance(bot_manager.bots[0], usdt_token).unwrap();
+        // let a_bot_usdt = engine.get_account_equity_token(bot_manager.bots[0], usdt_token).unwrap();
         // println!("a bot usdt: {}", a_bot_usdt);
-        // let a_bot_btc = engine.get_node_balance(bot_manager.bots[0], btc_token).unwrap();
+        // let a_bot_btc = engine.get_account_equity_token(bot_manager.bots[0], btc_token).unwrap();
         // println!("a bot btc: {}", a_bot_btc);
 
         step_count += 1;

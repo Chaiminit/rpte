@@ -235,6 +235,7 @@ impl PairNode for Pair {
 
     fn match_orders(&mut self) {
         let eps = Decimal::new(1, 12); // 1e-12
+        let min_unit = Decimal::new(1, self.precision as u32);
         let mut match_price = self.price;
 
         loop {
@@ -273,8 +274,15 @@ impl PairNode for Pair {
                 (sell.price + buy.price) / Decimal::new(2, 0)
             };
 
-            let match_base_volume = (buy.src_volume / match_price).min(sell.src_volume);
-            let match_quote_volume = (match_base_volume * match_price).min(buy.src_volume);
+            let match_base_volume = self.round((buy.src_volume / match_price).min(sell.src_volume));
+            let match_quote_volume = self.round((match_base_volume * match_price).min(buy.src_volume));
+
+            if match_base_volume <= eps {
+                // 无法进一步成交（精度截断后为0），跳过这对订单
+                self.order_book.cancel(buy.id);
+                self.order_book.cancel(sell.id);
+                continue;
+            }
 
             // 发消息让 Engine 执行转账
             self.send_msg(Msg::Transfer {
@@ -299,7 +307,7 @@ impl PairNode for Pair {
             let sell_remaining = sell.src_volume - match_base_volume;
 
             // 处理买单
-            if buy_remaining <= eps {
+            if buy_remaining <= min_unit {
                 self.send_msg(Msg::CloseOrder { order_id: buy.id });
                 self.order_book.cancel(buy.id);
             } else {
@@ -311,7 +319,7 @@ impl PairNode for Pair {
             }
 
             // 处理卖单
-            if sell_remaining <= eps {
+            if sell_remaining <= min_unit {
                 self.send_msg(Msg::CloseOrder { order_id: sell.id });
                 self.order_book.cancel(sell.id);
             } else {
@@ -328,6 +336,7 @@ impl PairNode for Pair {
 
     fn process_swap(&mut self, owner_id: usize, direction: Drt, volume: Decimal) -> (Vec<SwapTransfer>, Vec<usize>) {
         let eps = Decimal::new(1, 12); // 1e-12
+        let min_unit = Decimal::new(1, self.precision as u32);
         let mut transfers = Vec::new();
         let mut close_ids = Vec::new();
 
@@ -350,8 +359,14 @@ impl PairNode for Pair {
                 }
 
                 let max_base = remaining / sell.price;
-                let match_base = max_base.min(sell.src_volume);
-                let match_quote = (match_base * sell.price).min(remaining);
+                let match_base = self.round(max_base.min(sell.src_volume));
+                let match_quote = self.round((match_base * sell.price).min(remaining));
+
+                if match_base <= eps {
+                    close_ids.push(sell.id);
+                    self.order_book.cancel(sell.id);
+                    break;
+                }
 
                 transfers.push(SwapTransfer {
                     src_id: owner_id,
@@ -372,7 +387,7 @@ impl PairNode for Pair {
                 remaining -= match_quote;
 
                 let sell_remaining = sell.src_volume - match_base;
-                if sell_remaining <= eps {
+                if sell_remaining <= min_unit {
                     close_ids.push(sell.id);
                     self.order_book.cancel(sell.id);
                 } else {
@@ -399,8 +414,14 @@ impl PairNode for Pair {
 
                 let max_quote = buy.src_volume;
                 let max_base = max_quote / buy.price;
-                let match_base = max_base.min(remaining);
-                let match_quote = (match_base * buy.price).min(max_quote);
+                let match_base = self.round(max_base.min(remaining));
+                let match_quote = self.round((match_base * buy.price).min(max_quote));
+
+                if match_base <= eps {
+                    close_ids.push(buy.id);
+                    self.order_book.cancel(buy.id);
+                    break;
+                }
 
                 transfers.push(SwapTransfer {
                     src_id: owner_id,
@@ -421,12 +442,145 @@ impl PairNode for Pair {
                 remaining -= match_base;
 
                 let buy_remaining = buy.src_volume - match_quote;
-                if buy_remaining <= eps {
+                if buy_remaining <= min_unit {
                     close_ids.push(buy.id);
                     self.order_book.cancel(buy.id);
                 } else {
                     self.order_book.update_volume(buy.id, buy_remaining, buy.dst_volume);
                 }
+            }
+        }
+
+        (transfers, close_ids)
+    }
+
+    /// 批量按比例分配市价单撮合。
+    /// 同帧内所有 swap 共享流动性，按剩余需求比例分配每个价位的流动性。
+    fn process_swaps_batch(&mut self, direction: Drt, swaps: &[(usize, Decimal)]) -> (Vec<SwapTransfer>, Vec<usize>) {
+        let eps = Decimal::new(1, 12);
+        let min_unit = Decimal::new(1, self.precision as u32);
+        let mut transfers = Vec::new();
+        let mut close_ids = Vec::new();
+        let n = swaps.len();
+        let mut remain: Vec<Decimal> = swaps.iter().map(|(_, v)| *v).collect();
+
+        loop {
+            let total_remain: Decimal = remain.iter().sum();
+            if total_remain <= eps { break; }
+
+            // 获取本价位的最佳对手单
+            let ob_opt = if direction == Drt::Buy {
+                self.order_book.best_sell().cloned()
+            } else {
+                self.order_book.best_buy().cloned()
+            };
+            let ob = match ob_opt { Some(o) => o, None => break };
+            if ob.price <= eps {
+                close_ids.push(ob.id);
+                self.order_book.cancel(ob.id);
+                continue;
+            }
+
+            // 计算该订单能提供的流动性（以 source token 计）
+            // Buy: source=quote, 卖单 src_volume 是 base, 可提供 quote = src_volume * price
+            // Sell: source=base, 买单 src_volume 是 quote, 可提供 base = src_volume / price
+            let available_source = if direction == Drt::Buy {
+                (ob.src_volume * ob.price).min(total_remain)
+            } else {
+                (ob.src_volume / ob.price).min(total_remain)
+            };
+
+            if available_source <= eps {
+                close_ids.push(ob.id);
+                self.order_book.cancel(ob.id);
+                continue;
+            }
+
+            let (src_token, dst_token) = if direction == Drt::Buy {
+                (self.quote_token, self.base_token)
+            } else {
+                (self.base_token, self.quote_token)
+            };
+
+            // 按比例分配本价位流动性
+            let mut order_consumed_src = if direction == Drt::Buy {
+                Decimal::ZERO  // base consumed from sell order
+            } else {
+                Decimal::ZERO  // quote consumed from buy order
+            };
+
+            for i in 0..n {
+                if remain[i] <= eps { continue; }
+                let alloc = (available_source * remain[i] / total_remain).min(remain[i]);
+                if alloc <= eps { continue; }
+
+                let (match_source, match_dest, order_delta) = if direction == Drt::Buy {
+                    let ms = self.round(alloc);
+                    let md = self.round((ms / ob.price).min(ob.src_volume - order_consumed_src));
+                    (ms, md, md)
+                } else {
+                    let ms = self.round(alloc);
+                    let md = self.round((ms * ob.price).min(ob.src_volume - order_consumed_src));
+                    (ms, md, md)
+                };
+
+                if match_source <= eps { continue; }
+
+                transfers.push(SwapTransfer {
+                    src_id: swaps[i].0,
+                    dst_id: ob.id,
+                    token: src_token,
+                    volume: match_source,
+                });
+                transfers.push(SwapTransfer {
+                    src_id: ob.id,
+                    dst_id: swaps[i].0,
+                    token: dst_token,
+                    volume: match_dest,
+                });
+
+                // 记录成交日志
+                let (buy_node, sell_node, log_volume) = if direction == Drt::Buy {
+                    (swaps[i].0, ob.id, match_dest)
+                } else {
+                    (ob.id, swaps[i].0, match_source)
+                };
+                self.push_tra_log(self.step_count, buy_node, sell_node, ob.price, log_volume);
+
+                remain[i] -= match_source;
+                order_consumed_src += order_delta;
+            }
+
+            // 如果本轮未能消耗任何流动性（所有 alloc 都 round 到 0），跳过该订单
+            if order_consumed_src <= eps {
+                close_ids.push(ob.id);
+                self.order_book.cancel(ob.id);
+                continue;
+            }
+
+            // 更新价格
+            self.price = self.round(ob.price);
+
+            // 更新订单簿
+            let order_remaining = if direction == Drt::Buy {
+                ob.src_volume - order_consumed_src  // base remaining
+            } else {
+                ob.src_volume - order_consumed_src  // quote remaining
+            };
+
+            if order_remaining <= min_unit {
+                // 残留量低于最小精度单位，无实际价值，关闭
+                close_ids.push(ob.id);
+                self.order_book.cancel(ob.id);
+            } else {
+                let (new_src, new_dst) = if direction == Drt::Buy {
+                    // Sell order: src=base, dst=quote
+                    (order_remaining, ob.dst_volume + ob.price * order_consumed_src)
+                } else {
+                    // Buy order: src=quote, dst=base
+                    (order_remaining, ob.dst_volume + order_consumed_src / ob.price)
+                };
+                self.order_book.update_volume(ob.id, new_src, new_dst);
             }
         }
 

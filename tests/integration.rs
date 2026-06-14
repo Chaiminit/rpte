@@ -769,3 +769,186 @@ fn test_order_book_directions() {
     let depth = engine.get_order_book(btc, usdt, 0).unwrap();
     assert_eq!(depth.price, Decimal::ZERO);
 }
+
+// ============================
+// 多 Swap 同帧按比例分配测试
+// ============================
+
+#[test]
+fn test_multiple_swaps_same_step_proportional() {
+    let mut engine = Rpte::new("USDT", 5);
+    let usdt = engine.get_token_by_name("USDT").unwrap();
+    let btc = engine.register_token("BTC");
+
+    // 一个做市商提供流动性：以 50000 卖出 1 BTC
+    let maker = engine.register_account();
+    engine.issue(maker, btc, Decimal::new(1, 0)).unwrap();
+    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.step();
+    // 驱动一帧处理撮合消息（本帧没有对手单，仅挂单）
+    engine.step();
+
+    // 3 个 bot 在同一帧内市价买入 BTC
+    let bot1 = engine.register_account();
+    let bot2 = engine.register_account();
+    let bot3 = engine.register_account();
+
+    engine.issue(bot1, usdt, Decimal::new(50000, 0)).unwrap();
+    engine.issue(bot2, usdt, Decimal::new(50000, 0)).unwrap();
+    engine.issue(bot3, usdt, Decimal::new(50000, 0)).unwrap();
+
+    // 全部在同一帧内发出 swap 买单（花费 USDT 买 BTC）
+    engine.swap(bot1, usdt, btc, Decimal::new(3000, 0));
+    engine.swap(bot2, usdt, btc, Decimal::new(5000, 0));
+    engine.swap(bot3, usdt, btc, Decimal::new(2000, 0));
+    // 总额 10000 USDT, 流动性 1 BTC = 50000 USDT，足够覆盖
+    engine.step();
+    // 再一帧处理 close order
+    engine.step();
+
+    // 每个 bot 都应获得 BTC，且按比例分配
+    // total = 3000 + 5000 + 2000 = 10000
+    // bot1 份额: 3000/10000 = 30%
+    // bot2 份额: 5000/10000 = 50%
+    // bot3 份额: 2000/10000 = 20%
+    let b1 = engine.get_node_balance(bot1, btc).unwrap();
+    let b2 = engine.get_node_balance(bot2, btc).unwrap();
+    let b3 = engine.get_node_balance(bot3, btc).unwrap();
+
+    assert!(b1 > Decimal::ZERO, "bot1 should have BTC");
+    assert!(b2 > Decimal::ZERO, "bot2 should have BTC");
+    assert!(b3 > Decimal::ZERO, "bot3 should have BTC");
+
+    // 检查比例大致正确
+    assert!((b1 / b2 - Decimal::new(3, 0) / Decimal::new(5, 0)).abs() < Decimal::new(1, 4),
+        "bot1/bot2 ratio should be ~3/5, got {} / {}", b1, b2);
+    assert!((b3 / b2 - Decimal::new(2, 0) / Decimal::new(5, 0)).abs() < Decimal::new(1, 4),
+        "bot3/bot2 ratio should be ~2/5, got {} / {}", b3, b2);
+
+    // bot USDT 减少额之和应为 10000
+    let bot1_usdt_spent = Decimal::new(50000, 0) - engine.get_node_balance(bot1, usdt).unwrap();
+    let bot2_usdt_spent = Decimal::new(50000, 0) - engine.get_node_balance(bot2, usdt).unwrap();
+    let bot3_usdt_spent = Decimal::new(50000, 0) - engine.get_node_balance(bot3, usdt).unwrap();
+    let total_spent = bot1_usdt_spent + bot2_usdt_spent + bot3_usdt_spent;
+    assert_eq!(total_spent, Decimal::new(10000, 0),
+        "total USDT spent should be 10000, got {}", total_spent);
+}
+
+#[test]
+fn test_multiple_swaps_same_step_competition() {
+    let mut engine = Rpte::new("USDT", 5);
+    let usdt = engine.get_token_by_name("USDT").unwrap();
+    let btc = engine.register_token("BTC");
+
+    // 做市商提供有限流动性：以 50000 卖出 1 BTC
+    let maker = engine.register_account();
+    engine.issue(maker, btc, Decimal::new(1, 0)).unwrap();
+    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.step();
+    engine.step();
+
+    // 做市商再挂一单：以 51000 卖出 1 BTC
+    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(51000, 0));
+    engine.step();
+    engine.step();
+
+    // 3 个 bot 在同一帧竞争有限的流动性
+    let bot1 = engine.register_account();
+    let bot2 = engine.register_account();
+    let bot3 = engine.register_account();
+
+    engine.issue(bot1, usdt, Decimal::new(50000, 0)).unwrap();
+    engine.issue(bot2, usdt, Decimal::new(50000, 0)).unwrap();
+    engine.issue(bot3, usdt, Decimal::new(50000, 0)).unwrap();
+
+    // 每个都想要大量 BTC，但流动性有限
+    engine.swap(bot1, usdt, btc, Decimal::new(500, 0));
+    engine.swap(bot2, usdt, btc, Decimal::new(300, 0));
+    engine.swap(bot3, usdt, btc, Decimal::new(200, 0));
+    engine.step();
+    engine.step();
+
+    // 所有 bot 都应获得一些 BTC，且按比例分配
+    let b1 = engine.get_node_balance(bot1, btc).unwrap();
+    let b2 = engine.get_node_balance(bot2, btc).unwrap();
+    let b3 = engine.get_node_balance(bot3, btc).unwrap();
+
+    assert!(b1 > Decimal::ZERO, "bot1 should have BTC");
+    assert!(b2 > Decimal::ZERO, "bot2 should have BTC");
+    assert!(b3 > Decimal::ZERO, "bot3 should have BTC");
+
+    // 验证比例大致为 5:3:2
+    let ratio_total = b1 + b2 + b3;
+    assert!((b1 / ratio_total - Decimal::new(5, 1)).abs() < Decimal::new(1, 3),
+        "bot1 share should be ~0.5, got {}", b1 / ratio_total);
+    assert!((b2 / ratio_total - Decimal::new(3, 1)).abs() < Decimal::new(1, 3),
+        "bot2 share should be ~0.3, got {}", b2 / ratio_total);
+}
+
+#[test]
+fn test_multiple_swaps_and_openorders_same_step() {
+    let mut engine = Rpte::new("USDT", 5);
+    let usdt = engine.get_token_by_name("USDT").unwrap();
+    let btc = engine.register_token("BTC");
+
+    // 预先有流动性: 1 BTC @ 50000
+    let maker = engine.register_account();
+    engine.issue(maker, btc, Decimal::new(1, 0)).unwrap();
+    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.step();
+    engine.step();
+
+    // 同一帧内：maker2 新增流动性 + 2 个 swap
+    let maker2 = engine.register_account();
+    engine.issue(maker2, btc, Decimal::new(1, 0)).unwrap();
+
+    let bot1 = engine.register_account();
+    let bot2 = engine.register_account();
+    engine.issue(bot1, usdt, Decimal::new(50000, 0)).unwrap();
+    engine.issue(bot2, usdt, Decimal::new(50000, 0)).unwrap();
+
+    // 新流动性 + 2 个 swap 同时发生
+    engine.make(maker2, btc, usdt, Decimal::new(1, 0), Decimal::new(51000, 0));
+    engine.swap(bot1, usdt, btc, Decimal::new(500, 0));
+    engine.swap(bot2, usdt, btc, Decimal::new(500, 0));
+    engine.step();
+    engine.step();
+
+    let b1 = engine.get_node_balance(bot1, btc).unwrap();
+    let b2 = engine.get_node_balance(bot2, btc).unwrap();
+
+    // 应有成交，且无余额不足错误
+    assert!(b1 > Decimal::ZERO, "bot1 should have BTC");
+    assert!(b2 > Decimal::ZERO, "bot2 should have BTC");
+    // maker2 的订单可能部分成交或未成交（价格 51000，高于 50000，按价格优先不匹配）
+    let m2_bal = engine.get_node_balance(maker2, usdt).unwrap();
+    assert!(m2_bal >= Decimal::ZERO, "maker2 should not have negative USDT");
+}
+
+#[test]
+fn test_swap_insufficient_balance_not_crash() {
+    // 边缘场景：swap 时余额恰好只够部分成交，不会崩溃
+    let mut engine = Rpte::new("USDT", 5);
+    let usdt = engine.get_token_by_name("USDT").unwrap();
+    let btc = engine.register_token("BTC");
+
+    let maker = engine.register_account();
+    engine.issue(maker, btc, Decimal::new(1, 0)).unwrap();
+    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.step();
+    engine.step();
+
+    let bot = engine.register_account();
+    // bot 只有很少的 USDT
+    engine.issue(bot, usdt, Decimal::new(10, 0)).unwrap();
+
+    // 不会 panic
+    engine.swap(bot, usdt, btc, Decimal::new(100, 0));
+    engine.step();
+    engine.step();
+
+    // bot 余额应耗尽（最多能买的 BTC）
+    let usdt_bal = engine.get_node_balance(bot, usdt).unwrap();
+    assert!(usdt_bal == Decimal::ZERO || usdt_bal == Decimal::new(10, 0),
+        "bot should have 0 or 10 USDT left (only 10 issued), got {}", usdt_bal);
+}

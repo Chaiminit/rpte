@@ -164,6 +164,56 @@ impl Rpte {
         Ok(self.nodes[id].balance(token))
     }
 
+    /// 获取账户的完整权益 sheet（账户自身余额 + 所有挂单余额，按 token 汇总）。
+    pub fn get_account_equity(&mut self, account_id: usize) -> Result<HashMap<usize, Decimal>> {
+        if !self.registered_accounts.contains(&account_id) {
+            return Err(Error::NodeNotFound { id: account_id, len: self.nodes.len() });
+        }
+
+        let tokens: Vec<usize> = self.token_id_to_name.keys().copied().collect();
+
+        // 收集该账户下所有挂单 ID
+        let order_ids: Vec<usize> = {
+            let node = &mut self.nodes[account_id];
+            let account = node.as_account_node().ok_or(Error::NotAnAccountNode(account_id))?;
+            account.get_orders().iter().copied().collect()
+        };
+
+        let mut equity: HashMap<usize, Decimal> = HashMap::new();
+        for &token in &tokens {
+            let mut total = self.nodes[account_id].balance(token);
+            for &oid in &order_ids {
+                total += self.nodes[oid].balance(token);
+            }
+            if total != Decimal::ZERO {
+                equity.insert(token, total);
+            }
+        }
+        Ok(equity)
+    }
+
+    /// 获取账户在某个 token 上的权益量（账户自身余额 + 所有挂单中的该 token 余额）。
+    pub fn get_account_equity_token(&mut self, account_id: usize, token: usize) -> Result<Decimal> {
+        if !self.registered_accounts.contains(&account_id) {
+            return Err(Error::NodeNotFound { id: account_id, len: self.nodes.len() });
+        }
+        if !self.token_id_to_name.contains_key(&token) {
+            return Err(Error::TokenNotRegistered(token));
+        }
+
+        let order_ids: Vec<usize> = {
+            let node = &mut self.nodes[account_id];
+            let account = node.as_account_node().ok_or(Error::NotAnAccountNode(account_id))?;
+            account.get_orders().iter().copied().collect()
+        };
+
+        let mut total = self.nodes[account_id].balance(token);
+        for &oid in &order_ids {
+            total += self.nodes[oid].balance(token);
+        }
+        Ok(total)
+    }
+
     /// 获取当前价格。
     /// 返回 `(price, quote_token, base_token)`，含义为 1 base_token = price quote_token。
     pub fn get_current_price(&mut self, src_token: usize, dst_token: usize) -> Result<(Decimal, usize, usize)> {
@@ -309,6 +359,7 @@ impl Rpte {
 
     pub fn new_order(&mut self) -> usize {
         if let Some(id) = self.order_pool.pop() {
+            self.registered_orders.insert(id);
             id
         } else {
             let order = Order::default();
@@ -415,112 +466,139 @@ impl Rpte {
     }
 
     pub fn update(&mut self) {
+        // 收集初始消息（外部消息 + 节点消息）
         let mut all_msgs = take(&mut self.msgs);
-
         for node in &mut self.nodes {
-            let msgs = node.upload_msgs(self.step_count);
-            all_msgs.extend(msgs);
+            all_msgs.extend(node.upload_msgs(self.step_count));
         }
 
-        // === 第一遍：仅处理转账 ===
-        // 所有转账处理完毕后余额才是最终状态，避免后续 _update_order_for_pairs 读到半成品余额。
-        for msg in &all_msgs {
-            match msg {
-                Msg::Transfer { src_id, dst_id, token, volume, allow_negative } => {
-                    if let Err(e) = self._transfer(*src_id, *dst_id, *token, *volume, *allow_negative) {
-                        eprintln!("WARNING: transfer failed: {e}");
-                    }
-                    if let Err(e) = self._update_order_for_pairs(*src_id) {
-                        eprintln!("WARNING: update_order_for_pairs (src) failed: {e}");
-                    }
-                    if let Err(e) = self._update_order_for_pairs(*dst_id) {
-                        eprintln!("WARNING: update_order_for_pairs (dst) failed: {e}");
-                    }
-                }
-                Msg::TransferAll { src_id, dst_id } => {
-                    if let Err(e) = self._transfer_all(*src_id, *dst_id) {
-                        eprintln!("WARNING: transfer_all failed: {e}");
-                    }
-                    if let Err(e) = self._update_order_for_pairs(*src_id) {
-                        eprintln!("WARNING: update_order_for_pairs (src) failed: {e}");
-                    }
-                    if let Err(e) = self._update_order_for_pairs(*dst_id) {
-                        eprintln!("WARNING: update_order_for_pairs (dst) failed: {e}");
-                    }
-                }
-                _ => {}
+        // 按类型遍历 + 循环收敛：
+        //  轮次内顺序：转账 → 关单 → 开单/市价单
+        //  每轮结束后收集节点新产生的消息（match_orders 的 Transfer/CloseOrder），循环处理
+        loop {
+            if all_msgs.is_empty() {
+                break;
             }
-        }
 
-        // === 第二遍：先关闭所有已退场订单（避免后续撮合读到 stale 条目） ===
-        for msg in &all_msgs {
-            if let Msg::CloseOrder { order_id } = msg {
-                if let Err(e) = self._close_order(*order_id) {
-                    eprintln!("WARNING: CloseOrder failed: {e}");
+            // === 1. 处理所有转账 ===
+            let mut deferred: Vec<Msg> = Vec::new();
+            for msg in take(&mut all_msgs) {
+                match msg {
+                    Msg::Transfer { src_id, dst_id, token, volume, allow_negative } => {
+                        if let Err(e) = self._transfer(src_id, dst_id, token, volume, allow_negative) {
+                            eprintln!("WARNING: transfer failed: {e}");
+                        }
+                        let _ = self._update_order_for_pairs(src_id);
+                        let _ = self._update_order_for_pairs(dst_id);
+                    }
+                    Msg::TransferAll { src_id, dst_id } => {
+                        if let Err(e) = self._transfer_all(src_id, dst_id) {
+                            eprintln!("WARNING: transfer_all failed: {e}");
+                        }
+                        let _ = self._update_order_for_pairs(src_id);
+                        let _ = self._update_order_for_pairs(dst_id);
+                    }
+                    other => deferred.push(other),
                 }
             }
-        }
 
-        // === 第三遍：订单创建、撮合 ===
-        // 此时订单簿已清洗，SwapOrder 不会匹配到即将关闭的订单
-        for msg in all_msgs {
-            match msg {
-                Msg::Transfer { .. } | Msg::TransferAll { .. } | Msg::CloseOrder { .. } => {
-                    // 已在前两遍处理过
-                }
-                Msg::OpenOrder { src_id, owner_node_id, src_token, dst_token, volume, price } => {
-                    if volume.is_zero() || price.is_zero() || volume > self.get_node_balance(src_id, src_token).unwrap() {
-                        continue;
+            // === 2. 处理所有关单 ===
+            let mut remaining: Vec<Msg> = Vec::new();
+            for msg in deferred {
+                match msg {
+                    Msg::CloseOrder { order_id } => {
+                        if let Err(e) = self._close_order(order_id) {
+                            eprintln!("WARNING: CloseOrder failed: {e}");
+                        }
                     }
-                    let new_order_id = self.new_order();
-                    let (pair_node_id, _) = self.get_or_create_pair(src_token, dst_token);
-                    // 初始化新 Order + 转账
-                    let step_count_created = self.step_count;
-                    let order = match self.get_order_node(new_order_id) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            eprintln!("ERROR: OpenOrder: {e}");
+                    other => remaining.push(other),
+                }
+            }
+
+            // === 3. 处理所有开单/市价单 ===
+            //    开单 → 插入订单簿 → 触发 match_orders（同步更新订单簿、生成 Transfer/CloseOrder 消息）
+            //    市价单 → 按 (pair, direction) 分组后批量按比例分配
+            let mut swap_groups: HashMap<(usize, Drt), Vec<(usize, Decimal)>> = HashMap::new();
+            for msg in remaining {
+                match msg {
+                    Msg::OpenOrder { src_id, owner_node_id, src_token, dst_token, volume, price } => {
+                        if volume.is_zero() || price.is_zero() || volume > self.get_node_balance(src_id, src_token).unwrap_or(Decimal::ZERO) {
                             continue;
                         }
-                    };
-                    if !order.open(owner_node_id, pair_node_id, src_token, dst_token, price, step_count_created, OrderType::Make) {
-                        eprintln!("ERROR: OpenOrder: order.open failed (owner={owner_node_id})");
-                        continue;
-                    }
-                    if let Err(e) = self._transfer(src_id, new_order_id, src_token, volume, false) {
-                        eprintln!("WARNING: OpenOrder transfer failed: {e}");
-                    }
-                    // 插入订单簿并触发撮合
-                    if let Ok(brief) = self.get_order_brief(new_order_id) {
-                        if let Ok(pair) = self.get_pair_node(pair_node_id) {
-                            pair.insert_brief(brief.clone());
-                        }
-                        // 向 Owner Account 转发 brief
-                        if let Ok(account) = self.get_account_node(owner_node_id) {
-                            account.insert_order(new_order_id);
-                        }
-                    }
-                }
-                Msg::SwapOrder { src_id: _, owner_node_id, src_token, dst_token, volume } => {
-                    let (pair_node_id, _) = self.get_or_create_pair(src_token, dst_token);
-
-                    // 判断市价单方向
-                    let direction = {
-                        let pair = match self.get_pair_node(pair_node_id) {
-                            Ok(p) => p,
+                        let new_order_id = self.new_order();
+                        let (pair_node_id, _) = self.get_or_create_pair(src_token, dst_token);
+                        let step_count_created = self.step_count;
+                        let order = match self.get_order_node(new_order_id) {
+                            Ok(o) => o,
                             Err(e) => {
-                                eprintln!("ERROR: SwapOrder: {e}");
+                                eprintln!("ERROR: OpenOrder: {e}");
                                 continue;
                             }
                         };
-                        if pair.get_quote_token() == src_token && pair.get_base_token() == dst_token {
-                            Drt::Buy
-                        } else {
-                            Drt::Sell
+                        if !order.open(owner_node_id, pair_node_id, src_token, dst_token, price, step_count_created, OrderType::Make) {
+                            eprintln!("ERROR: OpenOrder: order.open failed (owner={owner_node_id})");
+                            continue;
                         }
-                    };
+                        if let Err(e) = self._transfer(src_id, new_order_id, src_token, volume, false) {
+                            eprintln!("WARNING: OpenOrder transfer failed: {e}");
+                        }
+                        if let Ok(brief) = self.get_order_brief(new_order_id) {
+                            if let Ok(pair) = self.get_pair_node(pair_node_id) {
+                                pair.insert_brief(brief.clone());
+                            }
+                            if let Ok(account) = self.get_account_node(owner_node_id) {
+                                account.insert_order(new_order_id);
+                            }
+                        }
+                    }
+                    Msg::SwapOrder { src_id: _, owner_node_id, src_token, dst_token, volume } => {
+                        let (pair_node_id, _) = self.get_or_create_pair(src_token, dst_token);
 
-                    // 直接调用 process_swap 获取转账指令（不创建临时订单）
+                        // 检查余额
+                        let balance = match self.get_node_balance(owner_node_id, src_token) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("ERROR: SwapOrder balance check failed: {e}");
+                                continue;
+                            }
+                        };
+                        let volume = volume.min(balance);
+                        if volume.is_zero() {
+                            continue;
+                        }
+
+                        // 判断方向
+                        let direction = {
+                            let pair = match self.get_pair_node(pair_node_id) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    eprintln!("ERROR: SwapOrder: {e}");
+                                    continue;
+                                }
+                            };
+                            if pair.get_quote_token() == src_token && pair.get_base_token() == dst_token {
+                                Drt::Buy
+                            } else {
+                                Drt::Sell
+                            }
+                        };
+
+                        swap_groups
+                            .entry((pair_node_id, direction))
+                            .or_default()
+                            .push((owner_node_id, volume));
+                    }
+                    Msg::Transfer { .. } | Msg::TransferAll { .. } | Msg::CloseOrder { .. } => {
+                        // 不应到达此处
+                    }
+                }
+            }
+
+            // === 3b. 批量处理按比例分配的市价单 ===
+            for ((pair_node_id, direction), swaps) in swap_groups {
+                if swaps.len() == 1 {
+                    // 单个 swap，沿用原有流程
+                    let (owner_id, volume) = swaps[0];
                     let (transfers, close_ids) = {
                         let pair = match self.get_pair_node(pair_node_id) {
                             Ok(p) => p,
@@ -529,36 +607,58 @@ impl Rpte {
                                 continue;
                             }
                         };
-                        pair.process_swap(owner_node_id, direction, volume)
+                        pair.process_swap(owner_id, direction, volume)
                     };
 
-                    // 在同一帧内执行所有转账
                     for t in transfers {
                         if let Err(e) = self._transfer(t.src_id, t.dst_id, t.token, t.volume, false) {
                             eprintln!("WARNING: Swap transfer failed: {e}");
                         }
-                        if let Err(e) = self._update_order_for_pairs(t.src_id) {
-                            eprintln!("WARNING: update_order_for_pairs (src) failed: {e}");
-                        }
-                        if let Err(e) = self._update_order_for_pairs(t.dst_id) {
-                            eprintln!("WARNING: update_order_for_pairs (dst) failed: {e}");
-                        }
+                        let _ = self._update_order_for_pairs(t.src_id);
+                        let _ = self._update_order_for_pairs(t.dst_id);
                     }
 
-                    // 关闭完全成交的订单
                     for order_id in close_ids {
-                        if let Err(e) = self._close_order(order_id) {
-                            eprintln!("WARNING: Close order after swap failed: {e}");
+                        self.msgs.push(Msg::CloseOrder { order_id });
+                    }
+                } else {
+                    // 多个 swap → 按比例分配
+                    let (transfers, close_ids) = {
+                        let pair = match self.get_pair_node(pair_node_id) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!("ERROR: SwapOrder batch: {e}");
+                                continue;
+                            }
+                        };
+                        pair.process_swaps_batch(direction, &swaps)
+                    };
+
+                    for t in transfers {
+                        if let Err(e) = self._transfer(t.src_id, t.dst_id, t.token, t.volume, false) {
+                            eprintln!("WARNING: Swap transfer failed: {e}");
                         }
+                        let _ = self._update_order_for_pairs(t.src_id);
+                        let _ = self._update_order_for_pairs(t.dst_id);
+                    }
+
+                    for order_id in close_ids {
+                        self.msgs.push(Msg::CloseOrder { order_id });
                     }
                 }
             }
+
+            // === 4. 收集节点新产生的消息（match_orders 的 Transfer/CloseOrder） ===
+            for node in &mut self.nodes {
+                all_msgs.extend(node.upload_msgs(self.step_count));
+            }
         }
+
         self.step_count += 1;
     }
 
     fn _close_order(&mut self, order_id: usize) -> Result<()> {
-        if !self.registered_orders.contains(&order_id) {
+        if !self.registered_orders.remove(&order_id) {
             return Ok(());
         }
         let (owner_id, pair_id) = match self.get_order_node(order_id) {

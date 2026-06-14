@@ -79,6 +79,10 @@ pub trait PairNode: Node {
     /// 市价单直接撮合，不创建临时订单节点。
     /// 返回 (转账指令列表, 需关闭的订单ID列表)，引擎在同一帧执行。
     fn process_swap(&mut self, owner_id: usize, direction: Drt, volume: Decimal) -> (Vec<SwapTransfer>, Vec<usize>);
+    /// 批量市价单按比例分配撮合。
+    /// swaps 为 [(owner_id, volume_in_source_token), ...]，同方向多个 swap 共享流动性。
+    /// 返回 (转账指令列表, 需关闭的订单ID列表)。
+    fn process_swaps_batch(&mut self, direction: Drt, swaps: &[(usize, Decimal)]) -> (Vec<SwapTransfer>, Vec<usize>);
 }
 
 
@@ -90,7 +94,7 @@ pub trait AccountNode: Node {
 
 
 
-#[derive(PartialEq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 pub enum Drt {
     Buy,
     Sell,
