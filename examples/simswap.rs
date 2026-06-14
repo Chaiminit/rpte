@@ -64,6 +64,10 @@ impl RandomBotManager {
                 rpte.cancel_order(order_id);
             }
 
+            if rng.gen_range(0.0..=1.0) < 0.8 {
+                continue;
+            }
+
             let src_token = self.tokens[rng.gen_range(0..self.tokens.len())];
             let dst_token = loop {
                 let dst = self.tokens[rng.gen_range(0..self.tokens.len())];

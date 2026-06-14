@@ -464,9 +464,12 @@ impl PairNode for Pair {
         let n = swaps.len();
         let mut remain: Vec<Decimal> = swaps.iter().map(|(_, v)| *v).collect();
 
+        let mut batch_guard = 500;
         loop {
             let total_remain: Decimal = remain.iter().sum();
             if total_remain <= eps { break; }
+            batch_guard -= 1;
+            if batch_guard == 0 { break; }
 
             // 获取本价位的最佳对手单
             let ob_opt = if direction == Drt::Buy {
@@ -502,29 +505,63 @@ impl PairNode for Pair {
                 (self.base_token, self.quote_token)
             };
 
-            // 按比例分配本价位流动性
-            let mut order_consumed_src = if direction == Drt::Buy {
-                Decimal::ZERO  // base consumed from sell order
-            } else {
-                Decimal::ZERO  // quote consumed from buy order
-            };
+            // 按比例分配本价位流动性（最大余数法，零残差）
+            // Phase 1: 计算每个 swap 的 floor 分配值
+            let mut allocs: Vec<(usize, Decimal)> = Vec::new(); // (swap_index, floor_source)
+            let mut total_floor = Decimal::ZERO;
 
             for i in 0..n {
                 if remain[i] <= eps { continue; }
-                let alloc = (available_source * remain[i] / total_remain).min(remain[i]);
-                if alloc <= eps { continue; }
+                let exact = available_source * remain[i] / total_remain;
+                let floor = self.round(exact);
+                if floor <= eps { continue; }
+                allocs.push((i, floor));
+                total_floor += floor;
+            }
 
-                let (match_source, match_dest, order_delta) = if direction == Drt::Buy {
-                    let ms = self.round(alloc);
-                    let md = self.round((ms / ob.price).min(ob.src_volume - order_consumed_src));
-                    (ms, md, md)
+            if allocs.is_empty() {
+                // 所有分配都 round 到 0，跳过该订单
+                close_ids.push(ob.id);
+                self.order_book.cancel(ob.id);
+                continue;
+            }
+
+            // Phase 2: 将剩余量分配给 fractional loss 最大的 swap
+            let remainder = available_source - total_floor;
+            if remainder >= min_unit {
+                // 按 fractional loss 降序排列（即 exact - floor 最大的排前面）
+                let mut frac_losses: Vec<(usize, Decimal)> = allocs.iter().map(|&(idx, floor)| {
+                    // 重新计算 exact
+                    let i = idx;
+                    let exact = available_source * remain[i] / total_remain;
+                    (idx, exact - floor)
+                }).collect();
+                frac_losses.sort_by(|a, b| b.1.cmp(&a.1));
+
+                let mut rem = remainder;
+                for (alloc_idx, _) in &frac_losses {
+                    if rem < min_unit { break; }
+                    // 找到 allocs 中的对应项并增加
+                    if let Some(entry) = allocs.iter_mut().find(|(idx, _)| idx == alloc_idx) {
+                        entry.1 += min_unit;
+                        rem -= min_unit;
+                    }
+                }
+            }
+
+            // Phase 3: 根据最终分配生成转账指令
+            let mut order_consumed_src = Decimal::ZERO;
+
+            for &(i, match_source) in &allocs {
+                let (match_dest, order_delta) = if direction == Drt::Buy {
+                    let md = self.round((match_source / ob.price).min(ob.src_volume - order_consumed_src));
+                    (md, md)
                 } else {
-                    let ms = self.round(alloc);
-                    let md = self.round((ms * ob.price).min(ob.src_volume - order_consumed_src));
-                    (ms, md, md)
+                    let md = self.round((match_source * ob.price).min(ob.src_volume - order_consumed_src));
+                    (md, md)
                 };
 
-                if match_source <= eps { continue; }
+                if match_dest <= eps { continue; }
 
                 transfers.push(SwapTransfer {
                     src_id: swaps[i].0,
@@ -551,7 +588,6 @@ impl PairNode for Pair {
                 order_consumed_src += order_delta;
             }
 
-            // 如果本轮未能消耗任何流动性（所有 alloc 都 round 到 0），跳过该订单
             if order_consumed_src <= eps {
                 close_ids.push(ob.id);
                 self.order_book.cancel(ob.id);

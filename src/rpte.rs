@@ -475,8 +475,14 @@ impl Rpte {
         // 按类型遍历 + 循环收敛：
         //  轮次内顺序：转账 → 关单 → 开单/市价单
         //  每轮结束后收集节点新产生的消息（match_orders 的 Transfer/CloseOrder），循环处理
+        let mut converge_guard = 1000;
         loop {
             if all_msgs.is_empty() {
+                break;
+            }
+            converge_guard -= 1;
+            if converge_guard == 0 {
+                eprintln!("WARNING: converge loop did not terminate, forcing exit");
                 break;
             }
 
