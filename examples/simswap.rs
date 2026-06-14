@@ -1,21 +1,22 @@
 use rand::Rng;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
+use rpte::tui;
 use rpte::Rpte;
 
 pub fn random_bot() -> (bool, Decimal, Decimal) {
     let mut rng = rand::thread_rng();
     let d: f64 = rng.gen_range(0.0..=1.0);
     if d <= 0.2 {
-        let amount_ratio: f64 = rng.gen_range(0.05..=0.5);
-        let amount_ratio = amount_ratio.powf(2.5);
+        let amount_ratio: f64 = rng.gen_range(0.05..=0.8);
+        let amount_ratio = amount_ratio.powf(3.0);
         let price_ratio = Decimal::ZERO;
         return (true, Decimal::from_f64(amount_ratio).unwrap(), price_ratio);
     } else {
         let amount_ratio: f64 = rng.gen_range(0.1..=0.95);
         let amount_ratio = amount_ratio.powf(2.0);
         let price_ratio: f64 = rng.gen_range(0.0..0.9);
-        let price_ratio = price_ratio.powf(3.0);
+        let price_ratio = price_ratio.powf(2.0);
         return (false, Decimal::from_f64(amount_ratio).unwrap(), Decimal::from_f64(price_ratio).unwrap());
     }
 }
@@ -98,7 +99,7 @@ impl RandomBotManager {
 }
 
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rpte = Rpte::new("USDT", 5);
     let mut bot_manager = RandomBotManager::new();
 
@@ -109,26 +110,14 @@ fn main() {
 
     for _i in 0..100 {
         let account = rpte.register_account();
-        let _ = rpte.issue(account, usdt_token, 1u64);
+        let _ = rpte.issue(account, usdt_token, 100u64);
         let _ = rpte.issue(account, btc_token, 1u64);
         bot_manager.add_bot(account);
     }
 
-    let mut step_count = 0u64;
-    rpte.run(100, |engine| {
-        bot_manager.step(engine);
-        let (price, _, _) = engine.get_current_price(btc_token, usdt_token).unwrap();
-        println!("btc price: {}", price);
-        // let order_book = engine.get_order_book(usdt_token, btc_token, 1).unwrap();
-        // println!("order book: {:?}", order_book);
-        // let a_bot_usdt = engine.get_account_equity_token(bot_manager.bots[0], usdt_token).unwrap();
-        // println!("a bot usdt: {}", a_bot_usdt);
-        // let a_bot_btc = engine.get_account_equity_token(bot_manager.bots[0], btc_token).unwrap();
-        // println!("a bot btc: {}", a_bot_btc);
+    tui::run_tui(&mut rpte, usdt_token, btc_token, 100, 50, |eng| {
+        bot_manager.step(eng);
+    })?;
 
-        step_count += 1;
-        if step_count >= 1000 {
-            engine.stop();
-        }
-    });
+    Ok(())
 }

@@ -66,6 +66,7 @@ pub mod pair;
 pub mod node;
 pub mod account;
 pub mod order_book;
+pub mod tui;
 
 pub use rpte::Rpte;
 pub use node::{Node, Msg, Drt, OrderBookDepth, PairNode, OrderNode, AccountNode, TokenNode};

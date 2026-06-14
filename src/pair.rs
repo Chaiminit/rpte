@@ -18,12 +18,12 @@ pub struct TraLog {
 
 #[derive(Clone)]
 pub struct CandleData {
-    step_count: u64,
-    open: Decimal,
-    high: Decimal,
-    low: Decimal,
-    close: Decimal,
-    volume: Decimal,
+    pub step_count: u64,
+    pub open: Decimal,
+    pub high: Decimal,
+    pub low: Decimal,
+    pub close: Decimal,
+    pub volume: Decimal,
 }
 
 

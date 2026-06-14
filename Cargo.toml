@@ -11,7 +11,9 @@ readme = "README.md"
 
 [dependencies]
 rust_decimal = "1.36"
-chrono = "0.4"
+ratatui-plt = "0.0.2"
+ratatui = "0.30"
+crossterm = "0.28"
 
 [dev-dependencies]
 rand = "0.8"
