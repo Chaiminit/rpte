@@ -8,11 +8,11 @@ use crate::order_book::OrderBook;
 
 #[derive(Clone)]
 pub struct TraLog {
-    step_count: u64,
-    buy_node: usize,
-    sell_node: usize,
-    price: Decimal,
-    volume: Decimal,
+    pub step_count: u64,
+    pub buy_node: usize,
+    pub sell_node: usize,
+    pub price: Decimal,
+    pub volume: Decimal,
 }
 
 
@@ -237,8 +237,14 @@ impl PairNode for Pair {
         let eps = Decimal::new(1, 12); // 1e-12
         let min_unit = Decimal::new(1, self.precision as u32);
         let mut match_price = self.price;
+        let mut match_guard = 5000;
 
         loop {
+            match_guard -= 1;
+            if match_guard == 0 {
+                eprintln!("WARNING: match_orders did not terminate (pair_id={}, step={})", self.id, self.step_count);
+                break;
+            }
             // 获取最佳买卖单
             let buy_opt = self.order_book.best_buy().cloned();
             let sell_opt = self.order_book.best_sell().cloned();
@@ -341,12 +347,18 @@ impl PairNode for Pair {
         let min_unit = Decimal::new(1, self.precision as u32);
         let mut transfers = Vec::new();
         let mut close_ids = Vec::new();
+        let mut swap_guard = 5000;
 
         if direction == Drt::Buy {
             // Swap Buy: 花费 quote_token 买入 base_token，匹配卖单队列
             let mut remaining = volume; // quote_token
 
             while remaining > eps {
+                swap_guard -= 1;
+                if swap_guard == 0 {
+                    eprintln!("WARNING: process_swap(Buy) did not terminate (pair_id={})", self.id);
+                    break;
+                }
                 let sell_opt = self.order_book.best_sell().cloned();
                 let sell = match sell_opt {
                     Some(s) => s,
@@ -365,9 +377,14 @@ impl PairNode for Pair {
                 let match_quote = self.round((match_base * sell.price).min(remaining));
 
                 if match_base <= eps {
+                    // 精度截断后 base 成交量为 0 → 该卖单无法继续成交，关闭
                     close_ids.push(sell.id);
                     self.order_book.cancel(sell.id);
                     continue;
+                }
+                if match_quote <= eps {
+                    // match_quote 被精度截断为 0 → remaining 无法再减少，退出循环
+                    break;
                 }
 
                 transfers.push(SwapTransfer {
@@ -401,6 +418,11 @@ impl PairNode for Pair {
             let mut remaining = volume; // base_token
 
             while remaining > eps {
+                swap_guard -= 1;
+                if swap_guard == 0 {
+                    eprintln!("WARNING: process_swap(Sell) did not terminate (pair_id={})", self.id);
+                    break;
+                }
                 let buy_opt = self.order_book.best_buy().cloned();
                 let buy = match buy_opt {
                     Some(b) => b,
@@ -471,7 +493,10 @@ impl PairNode for Pair {
             let total_remain: Decimal = remain.iter().sum();
             if total_remain <= eps { break; }
             batch_guard -= 1;
-            if batch_guard == 0 { break; }
+            if batch_guard == 0 {
+                eprintln!("WARNING: process_swaps_batch did not terminate (pair_id={})", self.id);
+                break;
+            }
 
             // 获取本价位的最佳对手单
             let ob_opt = if direction == Drt::Buy {
@@ -522,10 +547,11 @@ impl PairNode for Pair {
             }
 
             if allocs.is_empty() {
-                // 所有分配都 round 到 0，跳过该订单
+                // 所有分配都 round 到 0。
+                // 最佳价位都无法成交 → 更差价位更不可能，直接退出
                 close_ids.push(ob.id);
                 self.order_book.cancel(ob.id);
-                continue;
+                break;
             }
 
             // Phase 2: 将剩余量分配给 fractional loss 最大的 swap
@@ -591,9 +617,10 @@ impl PairNode for Pair {
             }
 
             if order_consumed_src <= eps {
+                // 所有 match_dest 都被截断为 0，最佳价位都无法成交 → 退出
                 close_ids.push(ob.id);
                 self.order_book.cancel(ob.id);
-                continue;
+                break;
             }
 
             // 更新价格

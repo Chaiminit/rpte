@@ -504,7 +504,6 @@ impl Rpte {
             }
             converge_guard -= 1;
             if converge_guard == 0 {
-                eprintln!("WARNING: converge loop did not terminate, forcing exit");
                 break;
             }
 

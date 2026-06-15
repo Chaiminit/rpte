@@ -110,8 +110,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _i in 0..200 {
         let account = rpte.register_account();
-        let _ = rpte.issue(account, usdt_token, 1000u64);
-        let _ = rpte.issue(account, btc_token, 10u64);
+        let _ = rpte.issue(account, usdt_token, 100000000u64);
+        let _ = rpte.issue(account, btc_token, 1000u64);
         bot_manager.add_bot(account);
     }
 
