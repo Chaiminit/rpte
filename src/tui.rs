@@ -35,7 +35,7 @@ use crate::Rpte;
 
 // ─── View modes ──────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum View {
     Pairs,
     Kline { src: usize, dst: usize },
@@ -58,6 +58,12 @@ struct AppState {
     cmd_history: Vec<String>,   // previously executed commands (newest last)
     history_idx: Option<usize>, // current position browsing history (None = new input)
     quit_requested: bool,       // set by :q command, checked in main loop
+    /// Step counter for throttling cache refreshes
+    refresh_counter: u64,
+    /// View navigation history (newest last)
+    view_history: Vec<View>,
+    /// Current position browsing view history (None = at latest view)
+    view_history_idx: Option<usize>,
     /// Pairs info cached for rendering
     pairs_cache: Vec<(usize, usize, usize, Decimal)>,
     /// K-line data cached for rendering
@@ -80,6 +86,9 @@ impl AppState {
             cmd_history: Vec::new(),
             history_idx: None,
             quit_requested: false,
+            refresh_counter: 0,
+            view_history: Vec::new(),
+            view_history_idx: None,
             pairs_cache: Vec::new(),
             candle_cache: VecDeque::new(),
             live_candle_cache: None,
@@ -89,6 +98,59 @@ impl AppState {
 
     fn set_msg(&mut self, msg: impl Into<String>) {
         self.msg = msg.into();
+    }
+
+    /// Switch to a view and record in navigation history.
+    fn switch_view(&mut self, new_view: View) {
+        // Don't duplicate consecutive same views
+        if self.view == new_view {
+            return;
+        }
+        self.view_history.push(self.view.clone());
+        if self.view_history.len() > 10 {
+            self.view_history.remove(0);
+        }
+        self.view = new_view;
+        self.view_history_idx = None;
+    }
+
+    /// Navigate backward in view history (Left arrow).
+    fn view_history_back(&mut self) -> bool {
+        if self.view_history.is_empty() {
+            return false;
+        }
+        let idx = match self.view_history_idx {
+            Some(i) => {
+                if i == 0 { return false; }
+                i - 1
+            }
+            None => {
+                // Save current view as latest
+                self.view_history.push(self.view.clone());
+                self.view_history.len() - 2
+            }
+        };
+        self.view_history_idx = Some(idx);
+        self.view = self.view_history[idx].clone();
+        true
+    }
+
+    /// Navigate forward in view history (Right arrow).
+    fn view_history_forward(&mut self) -> bool {
+        match self.view_history_idx {
+            Some(i) => {
+                let next = i + 1;
+                if next >= self.view_history.len() {
+                    // Past the end → back to latest view
+                    self.view_history_idx = None;
+                } else {
+                    self.view_history_idx = Some(next);
+                    self.view = self.view_history[next].clone();
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Navigate backward in history (Up). Returns true if a history entry was loaded.
@@ -215,6 +277,16 @@ where
                             state.cmd_mode = true;
                             state.history_forward();
                         }
+                        KeyCode::Left => {
+                            if state.view_history_back() {
+                                state.set_msg("");
+                            }
+                        }
+                        KeyCode::Right => {
+                            if state.view_history_forward() {
+                                state.set_msg("");
+                            }
+                        }
                         KeyCode::Esc => break 'main,
                         _ => {}
                     }
@@ -234,7 +306,11 @@ where
 // ─── Cache refresh ───────────────────────────────────────────────────────────
 
 fn refresh_caches(engine: &mut Rpte, state: &mut AppState) {
-    state.pairs_cache = engine.get_all_pairs_info();
+    state.refresh_counter += 1;
+    // 更新 pairs 价格：每 10 step 刷新一次
+    if state.refresh_counter % 10 == 0 {
+        state.pairs_cache = engine.get_all_pairs_info();
+    }
 
     if let View::Kline { src, dst } = state.view {
         state.candle_cache = engine
@@ -335,20 +411,21 @@ fn render_kline(
     let src_name = engine.get_token_name(src).unwrap_or("?");
     let dst_name = engine.get_token_name(dst).unwrap_or("?");
 
-    // Build title
+    // Build simplified title: only real-time price + previous candle volume
     let price_str = state
         .current_price_cache
         .map(|(p, _, _)| format!("{:.5}", p))
         .unwrap_or_else(|| "—".to_string());
-    let title = match &state.live_candle_cache {
-        Some(c) => format!(
-            "{}:{}  {}  O:{:.5} H:{:.5} L:{:.5} C:{:.5}",
-            src_name, dst_name, price_str, c.open, c.high, c.low, c.close,
-        ),
-        None => format!("{}:{}  {}", src_name, dst_name, price_str),
+    let vol_str = if state.candle_cache.len() >= 2 {
+        let prev = &state.candle_cache[state.candle_cache.len() - 2];
+        format!("{:.5}", prev.volume)
+    } else if state.candle_cache.len() == 1 {
+        format!("{:.5}", state.candle_cache[0].volume)
+    } else {
+        "—".to_string()
     };
-    // Append key hint
-    let title = format!("{}   [:] cmd  [q] quit", title);
+    let title = format!("{}:{}  Price: {}  Prev Vol: {}", src_name, dst_name, price_str, vol_str);
+    let title = format!("{}   [←→] views  [:] cmd", title);
 
     // Convert candle data
     let data: Vec<(f64, f64)> = state
@@ -702,7 +779,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
 
     match parts[0] {
         "pairs" | "p" => {
-            state.view = View::Pairs;
+            state.switch_view(View::Pairs);
             state.set_msg("Switched to pairs list");
         }
 
@@ -732,7 +809,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 };
                 let src_name = engine.get_token_name(src).unwrap_or("?");
                 let dst_name = engine.get_token_name(dst).unwrap_or("?");
-                state.view = View::Kline { src, dst };
+                state.switch_view(View::Kline { src, dst });
                 state.set_msg(format!("Showing K-line: {}/{} (#{})", src_name, dst_name, pair_id));
             } else if parts.len() >= 3 {
                 // kline <quote_token> <base_token>
@@ -752,7 +829,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                         return;
                     }
                 };
-                state.view = View::Kline { src, dst };
+                state.switch_view(View::Kline { src, dst });
                 state.set_msg(format!("Showing K-line: {}/{}", q_name, b_name));
             } else {
                 state.set_msg("Usage: kline <pair_id>  or  kline <quote_token> <base_token>");
@@ -780,7 +857,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 state.set_msg("Not logged in. Use :login <account_id> first");
                 return;
             }
-            state.view = View::Balance;
+            state.switch_view(View::Balance);
             state.set_msg("Showing balances");
         }
 
@@ -789,7 +866,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 state.set_msg("Not logged in. Use :login <account_id> first");
                 return;
             }
-            state.view = View::Orders;
+            state.switch_view(View::Orders);
             state.set_msg("Showing orders");
         }
 
@@ -890,7 +967,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
         }
 
         "help" | "h" | "?" => {
-            state.view = View::Help;
+            state.switch_view(View::Help);
             state.set_msg("");
         }
 
