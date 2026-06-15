@@ -147,6 +147,28 @@ impl Rpte {
         self.registered_pairs.iter().cloned().collect()
     }
 
+    /// 获取所有交易对的详细信息: (pair_id, quote_token, base_token, current_price)
+    pub fn get_all_pairs_info(&mut self) -> Vec<(usize, usize, usize, Decimal)> {
+        let ids: Vec<usize> = self.registered_pairs.iter().cloned().collect();
+        let mut result = Vec::new();
+        for id in ids {
+            if let Some(pair) = self.nodes.get_mut(id).and_then(|n| n.as_pair_node()) {
+                result.push((id, pair.get_quote_token(), pair.get_base_token(), pair.get_current_price()));
+            }
+        }
+        result
+    }
+
+    /// 获取交易对的 quote 代币
+    pub fn get_pair_quote_token(&mut self, pair_id: usize) -> Result<usize> {
+        self.get_pair_node(pair_id).map(|p| p.get_quote_token())
+    }
+
+    /// 获取交易对的 base 代币
+    pub fn get_pair_base_token(&mut self, pair_id: usize) -> Result<usize> {
+        self.get_pair_node(pair_id).map(|p| p.get_base_token())
+    }
+
     pub fn get_all_orders(&self) -> Vec<usize> {
         self.registered_orders.iter()
             .filter(|&&id| id < self.nodes.len() && self.nodes[id].is_open())
