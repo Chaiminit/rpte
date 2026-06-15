@@ -54,6 +54,7 @@ struct AppState {
     msg: String,                // status / error message
     interval: u64,
     max_candles: usize,
+    refresh_interval: u64,      // steps between pairs/balance cache refreshes
     logged_in_account: Option<usize>, // bound account for make/swap/orders/bal
     cmd_history: Vec<String>,   // previously executed commands (newest last)
     history_idx: Option<usize>, // current position browsing history (None = new input)
@@ -66,6 +67,8 @@ struct AppState {
     view_history_idx: Option<usize>,
     /// Pairs info cached for rendering
     pairs_cache: Vec<(usize, usize, usize, Decimal)>,
+    /// Balance cache: (token_name, available, equity, converted_to_quote)
+    balance_cache: Vec<(String, Decimal, Decimal, Decimal)>,
     /// K-line data cached for rendering
     candle_cache: VecDeque<crate::pair::CandleData>,
     live_candle_cache: Option<crate::pair::CandleData>,
@@ -73,7 +76,7 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(interval: u64, max_candles: usize) -> Self {
+    fn new(interval: u64, max_candles: usize, refresh_interval: u64) -> Self {
         Self {
             view: View::Pairs,
             cmd_buf: String::new(),
@@ -82,6 +85,7 @@ impl AppState {
             msg: String::new(),
             interval,
             max_candles,
+            refresh_interval,
             logged_in_account: None,
             cmd_history: Vec::new(),
             history_idx: None,
@@ -90,6 +94,7 @@ impl AppState {
             view_history: Vec::new(),
             view_history_idx: None,
             pairs_cache: Vec::new(),
+            balance_cache: Vec::new(),
             candle_cache: VecDeque::new(),
             live_candle_cache: None,
             current_price_cache: None,
@@ -219,6 +224,7 @@ pub fn run_tui<F>(
     engine: &mut Rpte,
     interval: u64,
     max_candles: usize,
+    refresh_interval: u64,
     login_id: Option<usize>,
     mut frame_callback: F,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -233,7 +239,7 @@ where
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut state = AppState::new(interval, max_candles);
+    let mut state = AppState::new(interval, max_candles, refresh_interval);
     if let Some(id) = login_id {
         state.logged_in_account = Some(id);
         state.set_msg(format!("Logged in as account #{}  |  :help for commands", id));
@@ -307,9 +313,33 @@ where
 
 fn refresh_caches(engine: &mut Rpte, state: &mut AppState) {
     state.refresh_counter += 1;
-    // 更新 pairs 价格：每 10 step 刷新一次
-    if state.refresh_counter % 10 == 0 {
+    let interval = state.refresh_interval.max(1);
+
+    if state.refresh_counter % interval == 0 {
+        // pairs 缓存
         state.pairs_cache = engine.get_all_pairs_info();
+
+        // balance 缓存（仅在已登录时更新）
+        if let Some(account_id) = state.logged_in_account {
+            let tokens = engine.get_all_tokens();
+            let quote_token = engine.get_global_quote_token();
+            let mut cache: Vec<(String, Decimal, Decimal, Decimal)> = Vec::new();
+            for &token in &tokens {
+                let bal = engine.get_node_balance(account_id, token).unwrap_or(Decimal::ZERO);
+                let equity = engine.get_account_equity_token(account_id, token).unwrap_or(Decimal::ZERO);
+                if equity.is_zero() {
+                    continue;
+                }
+                let name = engine.get_token_name(token).unwrap_or("?").to_string();
+                let converted = if token == quote_token {
+                    equity
+                } else {
+                    engine.convert_value(token, quote_token, equity)
+                };
+                cache.push((name, bal, equity, converted));
+            }
+            state.balance_cache = cache;
+        }
     }
 
     if let View::Kline { src, dst } = state.view {
@@ -478,39 +508,53 @@ fn render_balance(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let tokens = engine.get_all_tokens();
+    // 使用缓存的 balance 数据，避免每帧读引擎
+    if state.balance_cache.is_empty() {
+        let para = Paragraph::new("Loading…")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(para, inner);
+        return;
+    }
+
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::from(vec![
-        Span::styled("Token       Available     Equity       Locked", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("Token       Available     Equity        Converted", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(Span::styled(
         "─".repeat(inner.width as usize),
         Style::default().fg(Color::DarkGray),
     )));
 
-    let mut has_balance = false;
-    for &token in &tokens {
-        let bal = engine.get_node_balance(account_id, token).unwrap_or(Decimal::ZERO);
-        let equity = engine.get_account_equity_token(account_id, token).unwrap_or(Decimal::ZERO);
-        if equity.is_zero() {
-            continue;
-        }
-        has_balance = true;
-        let name = engine.get_token_name(token).unwrap_or("?");
-        let locked = equity - bal;
+    let quote_name = engine.get_token_name(engine.get_global_quote_token()).unwrap_or("?").to_string();
+    let mut total_converted = Decimal::ZERO;
+
+    for (name, bal, equity, converted) in &state.balance_cache {
+        total_converted += converted;
         lines.push(Line::from(vec![
             Span::styled(format!("{:<12}", name), Style::default().fg(Color::Green)),
             Span::styled(format!("{:<14.5}", bal), Style::default().fg(Color::White)),
             Span::styled(format!("{:<14.5}", equity), Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:.5}", locked), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:<14.5}", converted), Style::default().fg(Color::Cyan)),
         ]));
     }
 
-    if !has_balance {
-        lines.push(Line::from(
-            Span::styled("(no balances)", Style::default().fg(Color::DarkGray)),
-        ));
+    // 总权益（按全局计价 token 换算）
+    if !total_converted.is_zero() {
+        lines.push(Line::from(Span::styled(
+            "─".repeat(inner.width as usize),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<40}", format_args!("Total ({})", quote_name)),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:.5}", total_converted),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
     let para = Paragraph::new(lines);
@@ -771,6 +815,22 @@ fn handle_cmd_input<F: FnMut(&mut Rpte)>(
 
 // ─── Command execution ───────────────────────────────────────────────────────
 
+/// Parse a volume argument.  If the input starts with `/`, treat as `equity / N`.
+fn parse_vol(input: &str, engine: &mut Rpte, account_id: usize, src_token: usize) -> Result<Decimal, String> {
+    if let Some(rest) = input.strip_prefix('/') {
+        let divisor: u64 = rest.parse().map_err(|_| format!("Invalid fraction: {}", input))?;
+        if divisor == 0 {
+            return Err("Division by zero".to_string());
+        }
+        let equity = engine
+            .get_account_equity_token(account_id, src_token)
+            .map_err(|e| format!("Equity query failed: {}", e))?;
+        Ok(engine.round(equity / Decimal::from(divisor)))
+    } else {
+        input.parse().map_err(|_| format!("Invalid volume: {}", input))
+    }
+}
+
 fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() {
@@ -849,6 +909,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 }
             };
             state.logged_in_account = Some(id);
+            state.balance_cache.clear();
             state.set_msg(format!("Logged in as account #{}", id));
         }
 
@@ -897,10 +958,10 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                     return;
                 }
             };
-            let volume: Decimal = match parts[3].parse() {
+            let volume: Decimal = match parse_vol(parts[3], engine, account_id, src_token) {
                 Ok(n) => n,
-                Err(_) => {
-                    state.set_msg("Invalid volume");
+                Err(e) => {
+                    state.set_msg(e);
                     return;
                 }
             };
@@ -946,10 +1007,10 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                     return;
                 }
             };
-            let volume: Decimal = match parts[3].parse() {
+            let volume: Decimal = match parse_vol(parts[3], engine, account_id, src_token) {
                 Ok(n) => n,
-                Err(_) => {
-                    state.set_msg("Invalid volume");
+                Err(e) => {
+                    state.set_msg(e);
                     return;
                 }
             };

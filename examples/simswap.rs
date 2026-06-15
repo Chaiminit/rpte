@@ -118,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let player = rpte.register_account();
     let _ = rpte.issue(player, usdt_token, 10000u64);
 
-    tui::run_tui(&mut rpte, 100, 50, Some(player), |eng| {
+    tui::run_tui(&mut rpte, 100, 50, 10, Some(player), |eng| {
         bot_manager.step(eng);
     })?;
 

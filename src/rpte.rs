@@ -362,8 +362,82 @@ impl Rpte {
         (pair_id, is_forward)
     }
 
-    fn round(&self, value: Decimal) -> Decimal {
+    /// 截断到引擎精度
+    pub fn round(&self, value: Decimal) -> Decimal {
         value.round_dp_with_strategy(self.precision as u32, RoundingStrategy::ToZero)
+    }
+
+    /// 通过交易对路径将 src_token 的数量换算为 dst_token 的数量。
+    ///
+    /// 搜索顺序:
+    ///   1. 直接交易对 (src ↔ dst)
+    ///   2. 经全局计价 token 中转 (src → quote_token → dst)
+    ///
+    /// 换算方向根据交易对报价语义自动判断:
+    ///   - 正向 (src=quote, dst=base): `dst = src / price`
+    ///   - 反向 (src=base, dst=quote): `dst = src * price`
+    pub fn convert_value(&mut self, src_token: usize, dst_token: usize, amount: Decimal) -> Decimal {
+        if amount.is_zero() || src_token == dst_token {
+            return amount;
+        }
+
+        let pairs = self.get_all_pairs_info();
+        let quote = self.global_quote_token;
+
+        // 尝试通过一对 (quote, base, price) 换算
+        // 若 src==quote, dst==base: forward → amount / price
+        // 若 src==base, dst==quote: reverse → amount * price
+        let try_pair = |pairs: &[(usize, usize, usize, Decimal)], src: usize, dst: usize, amt: Decimal| -> Option<Decimal> {
+            for &(_, q, b, price) in pairs {
+                if price.is_zero() {
+                    continue;
+                }
+                if q == src && b == dst {
+                    return Some(self.round(amt / price));
+                }
+                if q == dst && b == src {
+                    return Some(self.round(amt * price));
+                }
+            }
+            None
+        };
+
+        // 1. 尝试直接交易对
+        if let Some(result) = try_pair(&pairs, src_token, dst_token, amount) {
+            return result;
+        }
+
+        // 2. 经全局计价 token 中转
+        if src_token != quote && dst_token != quote {
+            if let Some(mid) = try_pair(&pairs, src_token, quote, amount) {
+                if !mid.is_zero() {
+                    if let Some(result) = try_pair(&pairs, quote, dst_token, mid) {
+                        return result;
+                    }
+                }
+            }
+        }
+
+        Decimal::ZERO
+    }
+
+    /// 将账户所有 token 的权益量（余额 + 挂单）换算为 dst_token 的数量。
+    ///
+    /// `dst_token` 默认为全局计价 token（如 USDT）。
+    pub fn account_equity_value(&mut self, account_id: usize, dst_token: Option<usize>) -> Result<Decimal> {
+        let dst = dst_token.unwrap_or(self.global_quote_token);
+        let tokens: Vec<usize> = self.token_id_to_name.keys().copied().collect();
+        let mut total = Decimal::ZERO;
+
+        for &token in &tokens {
+            let equity = self.get_account_equity_token(account_id, token)?;
+            if equity.is_zero() {
+                continue;
+            }
+            total += self.convert_value(token, dst, equity);
+        }
+
+        Ok(total)
     }
 
     /// 发行资产到指定节点
