@@ -57,6 +57,7 @@ struct AppState {
     logged_in_account: Option<usize>, // bound account for make/swap/orders/bal
     cmd_history: Vec<String>,   // previously executed commands (newest last)
     history_idx: Option<usize>, // current position browsing history (None = new input)
+    quit_requested: bool,       // set by :q command, checked in main loop
     /// Pairs info cached for rendering
     pairs_cache: Vec<(usize, usize, usize, Decimal)>,
     /// K-line data cached for rendering
@@ -78,6 +79,7 @@ impl AppState {
             logged_in_account: None,
             cmd_history: Vec::new(),
             history_idx: None,
+            quit_requested: false,
             pairs_cache: Vec::new(),
             candle_cache: VecDeque::new(),
             live_candle_cache: None,
@@ -178,6 +180,9 @@ where
     }
 
     'main: loop {
+        if state.quit_requested {
+            break 'main;
+        }
         // Step engine
         frame_callback(engine);
         engine.step();
@@ -202,7 +207,15 @@ where
                             state.cmd_buf.clear();
                             state.cmd_cursor = 0;
                         }
-                        KeyCode::Char('q') | KeyCode::Esc => break 'main,
+                        KeyCode::Up => {
+                            state.cmd_mode = true;
+                            state.history_back();
+                        }
+                        KeyCode::Down => {
+                            state.cmd_mode = true;
+                            state.history_forward();
+                        }
+                        KeyCode::Esc => break 'main,
                         _ => {}
                     }
                 }
@@ -808,14 +821,14 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 }
             };
             let volume: Decimal = match parts[3].parse() {
-                Ok(n) => Decimal::new(n, 0),
+                Ok(n) => n,
                 Err(_) => {
                     state.set_msg("Invalid volume");
                     return;
                 }
             };
             let price: Decimal = match parts[4].parse() {
-                Ok(n) => Decimal::new(n, 0),
+                Ok(n) => n,
                 Err(_) => {
                     state.set_msg("Invalid price");
                     return;
@@ -857,7 +870,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 }
             };
             let volume: Decimal = match parts[3].parse() {
-                Ok(n) => Decimal::new(n, 0),
+                Ok(n) => n,
                 Err(_) => {
                     state.set_msg("Invalid volume");
                     return;
@@ -869,6 +882,11 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 "Market order placed: account #{} {}→{} vol={}",
                 account_id, parts[1], parts[2], volume
             ));
+        }
+
+        "q" | "quit" => {
+            // Will be handled by the caller checking state.quit_requested
+            state.quit_requested = true;
         }
 
         "help" | "h" | "?" => {

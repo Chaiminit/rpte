@@ -278,9 +278,10 @@ impl PairNode for Pair {
             let match_quote_volume = self.round((match_base_volume * match_price).min(buy.src_volume));
 
             if match_base_volume <= eps {
-                // 无法进一步成交（精度截断后为0），跳过这对订单
+                // 精度截断后成交量为0 → 买单剩余量太小无法继续成交
+                // 关闭买单，卖单保留继续等待后续对手单
+                self.send_msg(Msg::CloseOrder { order_id: buy.id });
                 self.order_book.cancel(buy.id);
-                self.order_book.cancel(sell.id);
                 continue;
             }
 
@@ -307,7 +308,8 @@ impl PairNode for Pair {
             let sell_remaining = sell.src_volume - match_base_volume;
 
             // 处理买单
-            if buy_remaining <= min_unit {
+            // 若剩余量 < min_unit，或剩余量不足以产生至少 1 min_unit 的下轮成交 → 关单
+            if buy_remaining <= min_unit || self.round(buy_remaining / buy.price) < min_unit {
                 self.send_msg(Msg::CloseOrder { order_id: buy.id });
                 self.order_book.cancel(buy.id);
             } else {
@@ -365,7 +367,7 @@ impl PairNode for Pair {
                 if match_base <= eps {
                     close_ids.push(sell.id);
                     self.order_book.cancel(sell.id);
-                    break;
+                    continue;
                 }
 
                 transfers.push(SwapTransfer {
@@ -420,7 +422,7 @@ impl PairNode for Pair {
                 if match_base <= eps {
                     close_ids.push(buy.id);
                     self.order_book.cancel(buy.id);
-                    break;
+                    continue;
                 }
 
                 transfers.push(SwapTransfer {
@@ -442,7 +444,7 @@ impl PairNode for Pair {
                 remaining -= match_base;
 
                 let buy_remaining = buy.src_volume - match_quote;
-                if buy_remaining <= min_unit {
+                if buy_remaining <= min_unit || self.round(buy_remaining / buy.price) < min_unit {
                     close_ids.push(buy.id);
                     self.order_book.cancel(buy.id);
                 } else {
@@ -604,7 +606,13 @@ impl PairNode for Pair {
                 ob.src_volume - order_consumed_src  // quote remaining
             };
 
-            if order_remaining <= min_unit {
+            // 对于买单剩余(quote)，额外检查是否能产生至少 1 min_unit 的下一轮成交
+            let too_small_for_next = if direction == Drt::Sell {
+                self.round(order_remaining / ob.price) < min_unit
+            } else {
+                false
+            };
+            if order_remaining <= min_unit || too_small_for_next {
                 // 残留量低于最小精度单位，无实际价值，关闭
                 close_ids.push(ob.id);
                 self.order_book.cancel(ob.id);
