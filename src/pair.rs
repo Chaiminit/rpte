@@ -68,6 +68,7 @@ impl Pair {
 
 impl Node for Pair {
     fn as_pair_node(&mut self) -> Option<&mut dyn PairNode> { Some(self) }
+    fn as_pair_node_ref(&self) -> Option<&dyn PairNode> { Some(self) }
     fn get_msgs(&mut self) -> &mut Vec<Msg> { &mut self.msgs }
     fn get_id(&self) -> usize { self.id } 
     fn set_id(&mut self, id: usize) { self.id = id; }
@@ -297,14 +298,12 @@ impl PairNode for Pair {
                 dst_id: sell.id,
                 token: self.quote_token,
                 volume: match_quote_volume,
-                allow_negative: false,
             });
             self.send_msg(Msg::Transfer {
                 src_id: sell.id,
                 dst_id: buy.id,
                 token: self.base_token,
                 volume: match_base_volume,
-                allow_negative: false,
             });
 
             self.push_tra_log(self.step_count, buy.id, sell.id, self.round(match_price), match_base_volume);

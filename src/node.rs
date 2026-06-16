@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use rust_decimal::Decimal;
 use crate::order::{OrderBrief, OrderType};
 use crate::pair::{TraLog, CandleData};
@@ -44,10 +45,31 @@ pub trait Node {
     fn as_pair_node(&mut self) -> Option<&mut dyn PairNode> { None }
     fn as_account_node(&mut self) -> Option<&mut dyn AccountNode> { None }
     fn as_token_node(&mut self) -> Option<&mut dyn TokenNode> { None }
+    fn as_contract_node(&mut self) -> Option<&mut dyn ContractNode> { None }
+
+    /// &self 版本转换方法（用于 EngineReader 只读访问）
+    fn as_pair_node_ref(&self) -> Option<&dyn PairNode> { None }
+    fn as_token_node_ref(&self) -> Option<&dyn TokenNode> { None }
+    fn as_account_node_ref(&self) -> Option<&dyn AccountNode> { None }
+    fn as_order_node_ref(&self) -> Option<&dyn OrderNode> { None }
 }
 
 
-pub trait TokenNode: Node {}
+pub trait TokenNode: Node {
+    /// 查询代币发行总量
+    fn total_supply(&self) -> Decimal;
+    /// 设置发行总量
+    fn set_total_supply(&mut self, supply: Decimal);
+    /// 增减发行量（默认实现基于 total_supply + set_total_supply）
+    fn adjust_total_supply(&mut self, delta: Decimal) {
+        let current = self.total_supply();
+        self.set_total_supply(current + delta);
+    }
+    /// 查询是否允许负持仓
+    fn can_be_negative(&self) -> bool;
+    /// 设置是否允许负持仓
+    fn set_can_be_negative(&mut self, can: bool);
+}
 
 pub trait OrderNode: Node {
     fn get_owner_node_id(&self) -> usize;
@@ -92,6 +114,67 @@ pub trait AccountNode: Node {
     fn get_orders(&self) -> &HashSet<usize>;
 }
 
+/// 合约状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractState {
+    /// 创建态：等待首次 update 触发 on_create
+    Creating,
+    /// 运行态：每帧调用 on_update
+    Running,
+    /// 结束态：等待下次 update 触发 on_end
+    Ending,
+    /// 销毁态：引擎回收
+    Destroyed,
+}
+
+/// 合约行为函数类型（Arc 包装，可 Clone，可放入 Msg）
+pub type ContractFn = Arc<dyn Fn(&mut crate::contract::Contract, &dyn EngineReader, u64) -> Vec<Msg> + Send + Sync>;
+
+pub trait ContractNode: Node {
+    fn get_state(&self) -> ContractState;
+    fn get_owner_node_id(&self) -> usize;
+    fn get_step_count_created(&self) -> u64;
+    /// 用行为函数部署合约（从池中取出或新建时调用）
+    fn deploy(&mut self, owner_node_id: usize, on_create: ContractFn, on_update: ContractFn, on_end: ContractFn, step_count: u64);
+    /// 标记为结束态（由 on_update 内部调用）
+    fn end(&mut self);
+    /// 获取合约的所有余额（用于主从同步）
+    fn get_all_balances(&self) -> &HashMap<usize, Decimal>;
+}
+
+/// 引擎只读视图：合约通过此 trait 读取引擎状态。
+///
+/// 所有方法均为 &self，可在引擎持有 &mut self.nodes 时安全调用。
+pub trait EngineReader {
+    fn precision(&self) -> u8;
+    fn global_quote_token(&self) -> usize;
+    fn get_token_name(&self, id: usize) -> Option<&str>;
+    fn get_all_tokens(&self) -> Vec<usize>;
+
+    /// 查询节点余额
+    fn node_balance(&self, node_id: usize, token: usize) -> Decimal;
+
+    /// 获取交易对当前价格（仅查询已有交易对，不自动创建）
+    fn get_current_price(&self, quote_token: usize, base_token: usize) -> Option<Decimal>;
+    /// 获取任意两个代币之间的价格
+    fn price_between(&self, src: usize, dst: usize) -> Option<(Decimal, usize, usize)>;
+    /// 跨代币换算
+    fn convert_value(&self, src: usize, dst: usize, amount: Decimal) -> Decimal;
+
+    /// 获取账户权益量（余额 + 挂单）
+    fn account_equity_token(&self, account_id: usize, token: usize) -> Decimal;
+
+    /// 代币元数据
+    fn token_total_supply(&self, token: usize) -> Decimal;
+    fn token_can_be_negative(&self, token: usize) -> bool;
+
+    /// 市场数据
+    fn get_order_book(&self, quote_token: usize, base_token: usize, depth: usize) -> Vec<OrderBookDepth>;
+    fn get_tra_logs(&self, quote_token: usize, base_token: usize) -> VecDeque<TraLog>;
+    fn get_candle_data(&self, quote_token: usize, base_token: usize, interval: u64) -> VecDeque<CandleData>;
+    fn latest_candle(&self, quote_token: usize, base_token: usize, interval: u64) -> Option<CandleData>;
+}
+
 
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
@@ -126,7 +209,6 @@ pub enum Msg {
         dst_id: usize,
         token: usize,
         volume: Decimal,
-        allow_negative: bool,
     },
     TransferAll {
         src_id: usize,
@@ -149,5 +231,11 @@ pub enum Msg {
     },
     CloseOrder {
         order_id: usize,
+    },
+    CreateContract {
+        owner_node_id: usize,
+        on_create: ContractFn,
+        on_update: ContractFn,
+        on_end: ContractFn,
     },
 }

@@ -339,8 +339,9 @@ fn test_issue_insufficient_balance() {
     let alice = engine.register_account();
     let bob = engine.register_account();
 
-    // Alice 没有 USDT，但 transfer_with_overdraft 允许透支
-    engine.transfer_with_overdraft(alice, bob, usdt, Decimal::new(100, 0));
+    // Alice 没有 USDT，但设置 USDT 允许负持仓即可透支
+    engine.set_token_can_be_negative(usdt, true).unwrap();
+    engine.transfer(alice, bob, usdt, Decimal::new(100, 0));
     engine.step();
     assert_eq!(engine.get_node_balance(alice, usdt).unwrap(), Decimal::new(-100, 0));
 }

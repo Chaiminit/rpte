@@ -42,6 +42,7 @@ pub struct OrderBrief {
 
 impl Node for Order {
     fn as_order_node(&mut self) -> Option<&mut dyn OrderNode> { Some(self) }
+    fn as_order_node_ref(&self) -> Option<&dyn OrderNode> { Some(self) }
     fn get_msgs(&mut self) -> &mut Vec<Msg> { &mut self.msgs }
     fn get_id(&self) -> usize { self.id }
     fn set_id(&mut self, id: usize) { self.id = id; }

@@ -8,6 +8,8 @@ pub struct Token {
     name: String,
     msgs: Vec<Msg>,
     sheet: HashMap<usize, Decimal>,
+    total_supply: Decimal,
+    can_be_negative: bool,
 }
 
 impl Token {
@@ -17,15 +19,21 @@ impl Token {
             name: name.to_string(),
             msgs: Vec::new(),
             sheet: HashMap::new(),
+            total_supply: Decimal::ZERO,
+            can_be_negative: false,
         }
     }
     pub fn name(&self) -> &str {
         &self.name
     }
+    pub fn total_supply(&self) -> Decimal {
+        self.total_supply
+    }
 }
 
 impl Node for Token {
     fn as_token_node(&mut self) -> Option<&mut dyn TokenNode> { Some(self) }
+    fn as_token_node_ref(&self) -> Option<&dyn TokenNode> { Some(self) }
     fn get_msgs(&mut self) -> &mut Vec<Msg> { &mut self.msgs }
     fn get_id(&self) -> usize { self.id }
     fn set_id(&mut self, id: usize) { self.id = id; }
@@ -41,4 +49,17 @@ impl Node for Token {
     }
 }
 
-impl TokenNode for Token {}
+impl TokenNode for Token {
+    fn total_supply(&self) -> Decimal {
+        self.total_supply
+    }
+    fn set_total_supply(&mut self, supply: Decimal) {
+        self.total_supply = supply;
+    }
+    fn can_be_negative(&self) -> bool {
+        self.can_be_negative
+    }
+    fn set_can_be_negative(&mut self, can: bool) {
+        self.can_be_negative = can;
+    }
+}

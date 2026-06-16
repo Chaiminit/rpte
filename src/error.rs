@@ -7,16 +7,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// 节点 ID 超出范围
     NodeNotFound { id: usize, len: usize },
+    /// 节点不是 TokenNode
+    NotATokenNode(usize),
     /// 节点不是 PairNode
     NotAPairNode(usize),
     /// 节点不是 OrderNode
     NotAnOrderNode(usize),
     /// 节点不是 AccountNode
     NotAnAccountNode(usize),
+    /// 节点不是 ContractNode
+    NotAContractNode(usize),
     /// Token 未注册
     TokenNotRegistered(usize),
     /// 订单未注册
     OrderNotRegistered(usize),
+    /// 合约未注册
+    ContractNotRegistered(usize),
     /// 余额不足
     InsufficientBalance {
         node_id: usize,
@@ -43,6 +49,9 @@ impl fmt::Display for Error {
             Error::NodeNotFound { id, len } => {
                 write!(f, "node {id} not found (len={len})")
             }
+            Error::NotATokenNode(id) => {
+                write!(f, "node {id} is not a TokenNode")
+            }
             Error::NotAPairNode(id) => {
                 write!(f, "node {id} is not a PairNode")
             }
@@ -52,11 +61,17 @@ impl fmt::Display for Error {
             Error::NotAnAccountNode(id) => {
                 write!(f, "node {id} is not an AccountNode")
             }
+            Error::NotAContractNode(id) => {
+                write!(f, "node {id} is not a ContractNode")
+            }
             Error::TokenNotRegistered(id) => {
                 write!(f, "token {id} is not registered")
             }
             Error::OrderNotRegistered(id) => {
                 write!(f, "order {id} is not registered")
+            }
+            Error::ContractNotRegistered(id) => {
+                write!(f, "contract {id} is not registered")
             }
             Error::InsufficientBalance {
                 node_id,
