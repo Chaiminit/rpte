@@ -142,10 +142,13 @@ pub type CalledFn = Arc<dyn Fn(&mut crate::contract::Contract, &dyn EngineReader
 
 pub trait ContractNode: Node {
     fn get_state(&self) -> ContractState;
+    fn set_state(&mut self, state: ContractState);
     fn get_owner_node_id(&self) -> usize;
     fn get_step_count_created(&self) -> u64;
+    fn get_name(&self) -> &str;
+    fn set_name(&mut self, name: &str);
     /// 用行为函数部署合约（从池中取出或新建时调用）
-    fn deploy(&mut self, owner_node_id: usize, on_create: ContractFn, on_update: ContractFn, on_end: ContractFn, on_called_fns: Vec<CalledFn>, step_count: u64);
+    fn deploy(&mut self, owner_node_id: usize, name: &str, on_create: ContractFn, on_update: ContractFn, on_end: ContractFn, on_called_fns: Vec<CalledFn>, step_count: u64);
     /// 标记为结束态（由 on_update 内部调用）
     fn end(&mut self);
     /// 获取合约的所有余额（用于主从同步）
@@ -246,6 +249,7 @@ pub enum Msg {
     },
     CreateContract {
         owner_node_id: usize,
+        name: String,
         on_create: ContractFn,
         on_update: ContractFn,
         on_end: ContractFn,

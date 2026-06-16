@@ -14,6 +14,7 @@ pub struct Contract {
     on_end: Option<ContractFn>,
     on_called_fns: Vec<CalledFn>,
     sheet: HashMap<usize, rust_decimal::Decimal>,
+    name: String,
 }
 
 impl Contract {
@@ -29,6 +30,7 @@ impl Contract {
             on_end: None,
             on_called_fns: Vec::new(),
             sheet: HashMap::new(),
+            name: String::new(),
         }
     }
 
@@ -96,11 +98,15 @@ impl Node for Contract {
 
 impl ContractNode for Contract {
     fn get_state(&self) -> ContractState { self.state }
+    fn set_state(&mut self, state: ContractState) { self.state = state; }
     fn get_owner_node_id(&self) -> usize { self.owner_node_id }
     fn get_step_count_created(&self) -> u64 { self.step_count_created }
+    fn get_name(&self) -> &str { &self.name }
+    fn set_name(&mut self, name: &str) { self.name = name.to_string(); }
 
-    fn deploy(&mut self, owner_node_id: usize, on_create: ContractFn, on_update: ContractFn, on_end: ContractFn, on_called_fns: Vec<CalledFn>, step_count: u64) {
+    fn deploy(&mut self, owner_node_id: usize, name: &str, on_create: ContractFn, on_update: ContractFn, on_end: ContractFn, on_called_fns: Vec<CalledFn>, step_count: u64) {
         self.owner_node_id = owner_node_id;
+        self.name = name.to_string();
         self.on_create = Some(on_create);
         self.on_update = Some(on_update);
         self.on_end = Some(on_end);

@@ -3,6 +3,7 @@ use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use rpte::tui;
 use rpte::Rpte;
+use rpte::LendingPreset;
 
 pub fn random_bot() -> (bool, Decimal, Decimal) {
     let mut rng = rand::thread_rng();
@@ -118,7 +119,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let player = rpte.register_account();
     let _ = rpte.issue(player, usdt_token, 10000u64);
 
-    tui::run_tui(&mut rpte, 100, 50, 10, Some(player), |eng| {
+    // 用 player 部署 USDT 资产 - BTC 质押 借贷合约
+    let lending = LendingPreset::new(
+        usdt_token,      // 资产代币
+        btc_token,       // 质押代币
+        "aUSDT",         // 资产凭证代币名称
+        "aBTC",          // 质押凭证代币名称
+        Decimal::new(15, 1),  // min_collateral_ratio = 1.50
+        Decimal::new(13, 1),  // liquidation_threshold = 1.30
+    );
+    let (on_create, on_update, on_end, on_called_fns) = lending.build();
+    rpte.deploy(player, "USDT/BTC Lending", on_create, on_update, on_end, on_called_fns);
+    // 跑一帧触发 on_create（注册凭证代币）
+    rpte.step();
+
+    tui::run_tui(&mut rpte, 100, 60, 10, Some(player), |eng| {
         bot_manager.step(eng);
     })?;
 

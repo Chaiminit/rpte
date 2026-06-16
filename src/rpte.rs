@@ -106,6 +106,13 @@ impl EngineReader for Rpte {
                 return Some((Decimal::ONE / price, dst, src));
             }
         }
+        // 通过 virtual_anchor 链换算凭证代币
+        if let Some(&anchor) = self.token_virtual_anchors.get(&src) {
+            return self.price_between(anchor, dst);
+        }
+        if let Some(&anchor) = self.token_virtual_anchors.get(&dst) {
+            return self.price_between(src, anchor);
+        }
         None
     }
 
@@ -386,6 +393,41 @@ impl Rpte {
         result
     }
 
+    /// 获取所有已注册合约的从实例 ID
+    pub fn get_all_contracts(&self) -> Vec<usize> {
+        self.registered_contracts.iter().copied().collect()
+    }
+
+    /// 获取合约的详细信息: (slave_id, owner_node_id, name, state, step_count_created)
+    pub fn get_contract_info(&mut self, slave_id: usize) -> Option<(usize, usize, String, ContractState, u64)> {
+        let contract = self.nodes.get_mut(slave_id).and_then(|n| n.as_contract_node())?;
+        Some((
+            slave_id,
+            contract.get_owner_node_id(),
+            contract.get_name().to_string(),
+            contract.get_state(),
+            contract.get_step_count_created(),
+        ))
+    }
+
+    /// 获取所有合约的详细信息: Vec<(slave_id, owner_node_id, name, state, step_count_created)>
+    pub fn get_all_contracts_info(&mut self) -> Vec<(usize, usize, String, ContractState, u64)> {
+        let ids: Vec<usize> = self.registered_contracts.iter().copied().collect();
+        let mut result = Vec::new();
+        for id in ids {
+            if let Some(contract) = self.nodes.get_mut(id).and_then(|n| n.as_contract_node()) {
+                result.push((
+                    id,
+                    contract.get_owner_node_id(),
+                    contract.get_name().to_string(),
+                    contract.get_state(),
+                    contract.get_step_count_created(),
+                ));
+            }
+        }
+        result
+    }
+
     /// 获取交易对的 quote 代币
     pub fn get_pair_quote_token(&mut self, pair_id: usize) -> Result<usize> {
         self.get_pair_node(pair_id).map(|p| p.get_quote_token())
@@ -487,6 +529,7 @@ impl Rpte {
     pub fn deploy(
         &mut self,
         owner_node_id: usize,
+        name: &str,
         on_create: ContractFn,
         on_update: ContractFn,
         on_end: ContractFn,
@@ -494,6 +537,7 @@ impl Rpte {
     ) {
         self.msgs.push(Msg::CreateContract {
             owner_node_id,
+            name: name.to_string(),
             on_create,
             on_update,
             on_end,
@@ -636,6 +680,37 @@ impl Rpte {
 
         if let Some(result) = try_pair(&pairs, src_token, dst_token, amount) {
             return result;
+        }
+
+        // 通过 virtual_anchor 链换算凭证代币
+        if let Some(&anchor) = self.token_virtual_anchors.get(&src_token) {
+            if let Some(result) = try_pair(&pairs, anchor, dst_token, amount) {
+                return result;
+            }
+            // anchor 可能也不是直接可交易，递归走 quote 路径
+            if anchor != quote && dst_token != quote {
+                if let Some(mid) = try_pair(&pairs, anchor, quote, amount) {
+                    if !mid.is_zero() {
+                        if let Some(result) = try_pair(&pairs, quote, dst_token, mid) {
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(&anchor) = self.token_virtual_anchors.get(&dst_token) {
+            if let Some(result) = try_pair(&pairs, src_token, anchor, amount) {
+                return result;
+            }
+            if src_token != quote && anchor != quote {
+                if let Some(mid) = try_pair(&pairs, src_token, quote, amount) {
+                    if !mid.is_zero() {
+                        if let Some(result) = try_pair(&pairs, quote, anchor, mid) {
+                            return result;
+                        }
+                    }
+                }
+            }
         }
 
         if src_token != quote && dst_token != quote {
@@ -793,6 +868,7 @@ impl Rpte {
     fn create_master_slave(
         &mut self,
         owner_node_id: usize,
+        name: &str,
         on_create: ContractFn,
         on_update: ContractFn,
         on_end: ContractFn,
@@ -802,7 +878,7 @@ impl Rpte {
         // 1. 创建主实例
         let mut master = Contract::new();
         let master_idx = self.contract_masters.len();
-        master.deploy(owner_node_id, on_create, on_update, on_end, on_called_fns, step_count);
+        master.deploy(owner_node_id, name, on_create, on_update, on_end, on_called_fns, step_count);
 
         // 2. 创建从实例（放入 nodes）
         let slave_id = self._new_contract_slot();
@@ -810,17 +886,16 @@ impl Rpte {
         self.nodes[slave_id].set_id(slave_id);
         // 从实例的状态设为 Running（它不运行闭包）
         if let Some(slave) = self.nodes[slave_id].as_contract_node() {
-            slave.deploy(owner_node_id,
+            slave.deploy(owner_node_id, name,
                 std::sync::Arc::new(|_, _, _| vec![]),  // 空操作
                 std::sync::Arc::new(|_, _, _| vec![]),
                 std::sync::Arc::new(|_, _, _| vec![]),
                 Vec::new(),
                 step_count,
             );
-            // deploy 设置 state=Creating，但从实例的 update 是空操作
-            // 所以手动设为 Running
-            // 但由于没有办法直接 set_state，我们用"立即跑到 Running"的方式
-            // 实际上，从实例的 update 是空操作，state=Creating 也无害
+            // deploy 将 state 设为 Creating，但从实例不需要运行闭包，
+            // 直接设为 Running 使其在 TUI 中正确显示
+            slave.set_state(ContractState::Running);
         }
         master.set_id(slave_id);
 
@@ -1098,9 +1173,9 @@ impl Rpte {
                             .or_default()
                             .push((owner_node_id, volume));
                     }
-                    Msg::CreateContract { owner_node_id, on_create, on_update, on_end, on_called } => {
+                    Msg::CreateContract { owner_node_id, name, on_create, on_update, on_end, on_called } => {
                         let step = self.step_count;
-                        self.create_master_slave(owner_node_id, on_create, on_update, on_end, on_called, step);
+                        self.create_master_slave(owner_node_id, &name, on_create, on_update, on_end, on_called, step);
                     }
                     Msg::RegisterToken { name, can_be_negative, not_tradable, virtual_anchor, swap_whitelist } => {
                         let id = self.register_token(&name);

@@ -32,6 +32,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::Rpte;
+use crate::node::ContractState;
 
 /// 按引擎精度格式化 Decimal（右对齐，定宽 + 动态小数位）
 fn fmt_val(val: &Decimal, prec: u8, width: usize) -> String {
@@ -51,6 +52,7 @@ enum View {
     Kline { src: usize, dst: usize },
     Balance,
     Orders,
+    Contracts,
     Help,
 }
 
@@ -83,6 +85,8 @@ struct AppState {
     candle_cache: VecDeque<crate::pair::CandleData>,
     live_candle_cache: Option<crate::pair::CandleData>,
     current_price_cache: Option<(Decimal, usize, usize)>,
+    /// Contracts cache: Vec<(slave_id, owner_node_id, name, state, step_count_created)>
+    contracts_cache: Vec<(usize, usize, String, ContractState, u64)>,
 }
 
 impl AppState {
@@ -108,6 +112,7 @@ impl AppState {
             candle_cache: VecDeque::new(),
             live_candle_cache: None,
             current_price_cache: None,
+            contracts_cache: Vec::new(),
         }
     }
 
@@ -329,6 +334,9 @@ fn refresh_caches(engine: &mut Rpte, state: &mut AppState) {
         // pairs 缓存
         state.pairs_cache = engine.get_all_pairs_info();
 
+        // contracts 缓存
+        state.contracts_cache = engine.get_all_contracts_info();
+
         // balance 缓存（仅在已登录时更新）
         if let Some(account_id) = state.logged_in_account {
             let tokens = engine.get_all_tokens();
@@ -382,6 +390,7 @@ fn render_content(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: 
         View::Kline { src, dst } => render_kline(f, area, engine, state, *src, *dst),
         View::Balance => render_balance(f, area, engine, state),
         View::Orders => render_orders(f, area, engine, state),
+        View::Contracts => render_contracts(f, area, engine, state),
         View::Help => render_help(f, area),
     }
 }
@@ -648,6 +657,64 @@ fn render_orders(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: &
     f.render_widget(para, inner);
 }
 
+// ─── Contracts view ────────────────────────────────────────────────────────
+
+fn render_contracts(f: &mut ratatui::Frame, area: Rect, _engine: &mut Rpte, state: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Contracts  ({})", state.contracts_cache.len()))
+        .style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if state.contracts_cache.is_empty() {
+        let para = Paragraph::new("No contracts deployed yet.")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(para, inner);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled("ID    ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("Name                      ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("Owner      ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("State         ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("StepCreated", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "─".repeat(inner.width as usize),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    for (slave_id, owner_id, name, state_code, step_created) in &state.contracts_cache {
+        let state_str = match state_code {
+            ContractState::Creating => "Creating ",
+            ContractState::Running => "Running  ",
+            ContractState::Ending => "Ending   ",
+            ContractState::Destroyed => "Destroyed",
+        };
+        let state_color = match state_code {
+            ContractState::Creating => Color::Cyan,
+            ContractState::Running => Color::Green,
+            ContractState::Ending => Color::Yellow,
+            ContractState::Destroyed => Color::DarkGray,
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<5} ", slave_id), Style::default().fg(Color::White)),
+            Span::styled(format!("{:<26}", name), Style::default().fg(Color::Green)),
+            Span::styled(format!("#{:<9}", owner_id), Style::default().fg(Color::Blue)),
+            Span::styled(format!("{:<13}", state_str), Style::default().fg(state_color)),
+            Span::styled(format!("{}", step_created), Style::default().fg(Color::Magenta)),
+        ]));
+    }
+
+    let para = Paragraph::new(lines);
+    f.render_widget(para, inner);
+}
+
 // ─── Help view ───────────────────────────────────────────────────────────────
 
 fn render_help(f: &mut ratatui::Frame, area: Rect) {
@@ -683,6 +750,17 @@ fn render_help(f: &mut ratatui::Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  orders              ", Style::default().fg(Color::Green)),
             Span::styled("Show open orders of logged-in account", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  contracts (cl)      ", Style::default().fg(Color::Green)),
+            Span::styled("List all contracts", Style::default().fg(Color::White)),
+        ]),
+        Line::from(Span::raw("")),
+        Line::from(Span::styled("Contracts:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled("  call <id> <fn> <vol>", Style::default().fg(Color::Green)),
+            Span::styled("Call contract fn (use login acct)", Style::default().fg(Color::White)),
         ]),
         Line::from(Span::raw("")),
         Line::from(Span::styled("Trading:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
@@ -1042,6 +1120,52 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
             state.set_msg(format!(
                 "Market order placed: account #{} {}→{} vol={}",
                 account_id, parts[1], parts[2], volume
+            ));
+        }
+
+        "contracts" | "cl" => {
+            state.switch_view(View::Contracts);
+            state.set_msg(format!("Showing {} contracts", state.contracts_cache.len()));
+        }
+
+        "call" | "c" => {
+            let account_id = match state.logged_in_account {
+                Some(id) => id,
+                None => {
+                    state.set_msg("Not logged in. Use :login <account_id> first");
+                    return;
+                }
+            };
+            // call <contract_id> <fn_id> <volume>
+            if parts.len() < 4 {
+                state.set_msg("Usage: call <contract_id> <fn_id> <volume>");
+                return;
+            }
+            let contract_id: usize = match parts[1].parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    state.set_msg("Invalid contract ID (must be a number)");
+                    return;
+                }
+            };
+            let fn_id: u8 = match parts[2].parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    state.set_msg("Invalid function ID (must be 0-255)");
+                    return;
+                }
+            };
+            let volume: Decimal = match parts[3].parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    state.set_msg("Invalid volume");
+                    return;
+                }
+            };
+            engine.call_contract(account_id, contract_id, fn_id, volume);
+            state.set_msg(format!(
+                "Call contract #{} fn={} vol={} (acct #{})",
+                contract_id, fn_id, volume, account_id
             ));
         }
 

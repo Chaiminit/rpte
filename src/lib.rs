@@ -67,6 +67,7 @@ pub mod node;
 pub mod account;
 pub mod contract;
 pub mod order_book;
+pub mod presets;
 pub mod tui;
 
 pub use rpte::Rpte;
@@ -77,4 +78,5 @@ pub use account::Account;
 pub use pair::{Pair, TraLog, CandleData};
 pub use contract::Contract;
 pub use order_book::OrderBook;
+pub use presets::LendingPreset;
 pub use error::{Error, Result};
