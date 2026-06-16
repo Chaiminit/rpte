@@ -69,6 +69,14 @@ pub trait TokenNode: Node {
     fn can_be_negative(&self) -> bool;
     /// 设置是否允许负持仓
     fn set_can_be_negative(&mut self, can: bool);
+    /// 查询是否不可在交易对中自由交换
+    fn not_tradable(&self) -> bool;
+    /// 设置不可自由交换
+    fn set_not_tradable(&mut self, v: bool);
+    /// 交换白名单：此代币只能与白名单内的其他代币组成交易对。空集合 = 允许自由组合。
+    fn swap_whitelist(&self) -> &HashSet<usize>;
+    /// 设置交换白名单
+    fn set_swap_whitelist(&mut self, whitelist: HashSet<usize>);
 }
 
 pub trait OrderNode: Node {
@@ -129,13 +137,15 @@ pub enum ContractState {
 
 /// 合约行为函数类型（Arc 包装，可 Clone，可放入 Msg）
 pub type ContractFn = Arc<dyn Fn(&mut crate::contract::Contract, &dyn EngineReader, u64) -> Vec<Msg> + Send + Sync>;
+/// 合约调用函数类型：传入合约、引擎只读视图、调用者 ID、调用量，返回消息列表
+pub type CalledFn = Arc<dyn Fn(&mut crate::contract::Contract, &dyn EngineReader, usize, Decimal) -> Vec<Msg> + Send + Sync>;
 
 pub trait ContractNode: Node {
     fn get_state(&self) -> ContractState;
     fn get_owner_node_id(&self) -> usize;
     fn get_step_count_created(&self) -> u64;
     /// 用行为函数部署合约（从池中取出或新建时调用）
-    fn deploy(&mut self, owner_node_id: usize, on_create: ContractFn, on_update: ContractFn, on_end: ContractFn, step_count: u64);
+    fn deploy(&mut self, owner_node_id: usize, on_create: ContractFn, on_update: ContractFn, on_end: ContractFn, on_called_fns: Vec<CalledFn>, step_count: u64);
     /// 标记为结束态（由 on_update 内部调用）
     fn end(&mut self);
     /// 获取合约的所有余额（用于主从同步）
@@ -149,7 +159,9 @@ pub trait EngineReader {
     fn precision(&self) -> u8;
     fn global_quote_token(&self) -> usize;
     fn get_token_name(&self, id: usize) -> Option<&str>;
+    fn get_token_by_name(&self, name: &str) -> Option<usize>;
     fn get_all_tokens(&self) -> Vec<usize>;
+    fn get_all_accounts(&self) -> Vec<usize>;
 
     /// 查询节点余额
     fn node_balance(&self, node_id: usize, token: usize) -> Decimal;
@@ -237,5 +249,28 @@ pub enum Msg {
         on_create: ContractFn,
         on_update: ContractFn,
         on_end: ContractFn,
+        on_called: Vec<CalledFn>,
+    },
+    RegisterToken {
+        name: String,
+        can_be_negative: bool,
+        not_tradable: bool,
+        /// 虚拟锚定代币：此代币与非交易对的锚定代币 1:1 价值绑定（用于查价）
+        virtual_anchor: Option<usize>,
+        /// 交换白名单：仅允许与这些代币组成交易对。空 Vec = 自由组合。
+        swap_whitelist: Vec<usize>,
+    },
+    /// 调用合约：src_id 向 contract_id 发起调用，携带 volume
+    CallContract {
+        src_id: usize,
+        contract_id: usize,
+        fn_id: u8,
+        volume: Decimal,
+    },
+    /// 增发（正 volume）或销毁（负 volume）代币
+    Issue {
+        token: usize,
+        account_id: usize,
+        volume: Decimal,
     },
 }

@@ -66,7 +66,6 @@ pub mod pair;
 pub mod node;
 pub mod account;
 pub mod contract;
-pub mod oracle;
 pub mod order_book;
 pub mod tui;
 
@@ -77,6 +76,5 @@ pub use token::Token;
 pub use account::Account;
 pub use pair::{Pair, TraLog, CandleData};
 pub use contract::Contract;
-pub use oracle::Oracle;
 pub use order_book::OrderBook;
 pub use error::{Error, Result};

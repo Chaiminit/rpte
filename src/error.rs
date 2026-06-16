@@ -41,6 +41,8 @@ pub enum Error {
     OrderOpenFailed(usize),
     /// 索引越界
     IndexOutOfBounds { id: usize, len: usize },
+    /// 代币交换不被允许（白名单限制）
+    SwapNotAllowed { src: usize, dst: usize },
 }
 
 impl fmt::Display for Error {
@@ -100,6 +102,9 @@ impl fmt::Display for Error {
             }
             Error::IndexOutOfBounds { id, len } => {
                 write!(f, "index {id} out of bounds (len={len})")
+            }
+            Error::SwapNotAllowed { src, dst } => {
+                write!(f, "swap not allowed: token {src} ↔ token {dst} (whitelist restriction)")
             }
         }
     }

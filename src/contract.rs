@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use crate::node::{Node, Msg, ContractNode, ContractState, ContractFn, EngineReader};
+use rust_decimal::Decimal;
+use crate::node::{Node, Msg, ContractNode, ContractState, ContractFn, CalledFn, EngineReader};
 
 /// 合约节点：包含三个行为函数的状态机
 pub struct Contract {
@@ -11,6 +12,7 @@ pub struct Contract {
     on_create: Option<ContractFn>,
     on_update: Option<ContractFn>,
     on_end: Option<ContractFn>,
+    on_called_fns: Vec<CalledFn>,
     sheet: HashMap<usize, rust_decimal::Decimal>,
 }
 
@@ -25,8 +27,19 @@ impl Contract {
             on_create: None,
             on_update: None,
             on_end: None,
+            on_called_fns: Vec::new(),
             sheet: HashMap::new(),
         }
+    }
+
+    /// 外部调用合约（由引擎在处理 Msg::CallContract 时调用）
+    pub fn call(&mut self, reader: &dyn EngineReader, caller_id: usize, fn_id: u8, volume: Decimal) -> Vec<Msg> {
+        let idx = fn_id as usize;
+        if idx >= self.on_called_fns.len() {
+            return Vec::new();
+        }
+        let f = self.on_called_fns[idx].clone();
+        f(self, reader, caller_id, volume)
     }
 
     /// 主实例专用：使用 EngineReader 触发状态机更新
@@ -86,11 +99,12 @@ impl ContractNode for Contract {
     fn get_owner_node_id(&self) -> usize { self.owner_node_id }
     fn get_step_count_created(&self) -> u64 { self.step_count_created }
 
-    fn deploy(&mut self, owner_node_id: usize, on_create: ContractFn, on_update: ContractFn, on_end: ContractFn, step_count: u64) {
+    fn deploy(&mut self, owner_node_id: usize, on_create: ContractFn, on_update: ContractFn, on_end: ContractFn, on_called_fns: Vec<CalledFn>, step_count: u64) {
         self.owner_node_id = owner_node_id;
         self.on_create = Some(on_create);
         self.on_update = Some(on_update);
         self.on_end = Some(on_end);
+        self.on_called_fns = on_called_fns;
         self.step_count_created = step_count;
         self.state = ContractState::Creating;
     }

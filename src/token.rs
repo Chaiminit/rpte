@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use rust_decimal::Decimal;
 use crate::node::{Node, Msg, TokenNode};
 
@@ -10,6 +10,8 @@ pub struct Token {
     sheet: HashMap<usize, Decimal>,
     total_supply: Decimal,
     can_be_negative: bool,
+    not_tradable: bool,
+    swap_whitelist: HashSet<usize>,
 }
 
 impl Token {
@@ -21,6 +23,8 @@ impl Token {
             sheet: HashMap::new(),
             total_supply: Decimal::ZERO,
             can_be_negative: false,
+            not_tradable: false,
+            swap_whitelist: HashSet::new(),
         }
     }
     pub fn name(&self) -> &str {
@@ -61,5 +65,17 @@ impl TokenNode for Token {
     }
     fn set_can_be_negative(&mut self, can: bool) {
         self.can_be_negative = can;
+    }
+    fn not_tradable(&self) -> bool {
+        self.not_tradable
+    }
+    fn set_not_tradable(&mut self, v: bool) {
+        self.not_tradable = v;
+    }
+    fn swap_whitelist(&self) -> &HashSet<usize> {
+        &self.swap_whitelist
+    }
+    fn set_swap_whitelist(&mut self, whitelist: HashSet<usize>) {
+        self.swap_whitelist = whitelist;
     }
 }

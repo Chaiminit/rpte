@@ -33,6 +33,16 @@ use rust_decimal::Decimal;
 
 use crate::Rpte;
 
+/// 按引擎精度格式化 Decimal（右对齐，定宽 + 动态小数位）
+fn fmt_val(val: &Decimal, prec: u8, width: usize) -> String {
+    format!("{:<width$.prec$}", val, width = width, prec = prec as usize)
+}
+
+/// 按引擎精度格式化 Decimal（无宽度填充）
+fn fmt_val_nopad(val: &Decimal, prec: u8) -> String {
+    format!("{:.prec$}", val, prec = prec as usize)
+}
+
 // ─── View modes ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -379,6 +389,7 @@ fn render_content(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: 
 // ─── Pairs list ──────────────────────────────────────────────────────────────
 
 fn render_pairs(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: &AppState) {
+    let prec = engine.get_precision();
     let title = format!("Trading Pairs  ({})", state.pairs_cache.len());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -400,11 +411,10 @@ fn render_pairs(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: &A
 
     // Header
     lines.push(Line::from(vec![
-        Span::styled("ID  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("Quote", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("  ", Style::default()),
-        Span::styled("Base", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("        Price", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("ID    ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("Quote      ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("Base      ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("            Price", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(Span::styled(
         "─".repeat(inner.width as usize),
@@ -414,13 +424,13 @@ fn render_pairs(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: &A
     for (pair_id, qt, bt, price) in &state.pairs_cache {
         let qname = engine.get_token_name(*qt).unwrap_or("?");
         let bname = engine.get_token_name(*bt).unwrap_or("?");
-        let price_str = format!("{:.5}", price);
+        let price_str = fmt_val_nopad(price, prec);
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<3} ", pair_id), Style::default().fg(Color::White)),
-            Span::styled(format!("{:<5}", qname), Style::default().fg(Color::Green)),
+            Span::styled(format!("{:<5} ", pair_id), Style::default().fg(Color::White)),
+            Span::styled(format!("{:<10}", qname), Style::default().fg(Color::Green)),
             Span::styled("  ", Style::default()),
-            Span::styled(format!("{:<5}", bname), Style::default().fg(Color::Green)),
-            Span::styled(format!("  {:>12}", price_str), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{:<10}", bname), Style::default().fg(Color::Green)),
+            Span::styled(format!("  {:>16}", price_str), Style::default().fg(Color::Yellow)),
         ]));
     }
 
@@ -441,16 +451,17 @@ fn render_kline(
     let src_name = engine.get_token_name(src).unwrap_or("?");
     let dst_name = engine.get_token_name(dst).unwrap_or("?");
 
+    let prec = engine.get_precision();
     // Build simplified title: only real-time price + previous candle volume
     let price_str = state
         .current_price_cache
-        .map(|(p, _, _)| format!("{:.5}", p))
+        .map(|(p, _, _)| fmt_val_nopad(&p, prec))
         .unwrap_or_else(|| "—".to_string());
     let vol_str = if state.candle_cache.len() >= 2 {
         let prev = &state.candle_cache[state.candle_cache.len() - 2];
-        format!("{:.5}", prev.volume)
+        fmt_val_nopad(&prev.volume, prec)
     } else if state.candle_cache.len() == 1 {
-        format!("{:.5}", state.candle_cache[0].volume)
+        fmt_val_nopad(&state.candle_cache[0].volume, prec)
     } else {
         "—".to_string()
     };
@@ -519,23 +530,24 @@ fn render_balance(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: 
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::from(vec![
-        Span::styled("Token       Available     Equity        Converted", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("Token           Available           Equity            Converted", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(Span::styled(
         "─".repeat(inner.width as usize),
         Style::default().fg(Color::DarkGray),
     )));
 
+    let prec = engine.get_precision();
     let quote_name = engine.get_token_name(engine.get_global_quote_token()).unwrap_or("?").to_string();
     let mut total_converted = Decimal::ZERO;
 
     for (name, bal, equity, converted) in &state.balance_cache {
         total_converted += converted;
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<12}", name), Style::default().fg(Color::Green)),
-            Span::styled(format!("{:<14.5}", bal), Style::default().fg(Color::White)),
-            Span::styled(format!("{:<14.5}", equity), Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{:<14.5}", converted), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:<16}", name), Style::default().fg(Color::Green)),
+            Span::styled(fmt_val(bal, prec, 18), Style::default().fg(Color::White)),
+            Span::styled(fmt_val(equity, prec, 18), Style::default().fg(Color::Yellow)),
+            Span::styled(fmt_val(converted, prec, 18), Style::default().fg(Color::Cyan)),
         ]));
     }
 
@@ -547,11 +559,11 @@ fn render_balance(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: 
         )));
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{:<40}", format_args!("Total ({})", quote_name)),
+                format!("{:<52}", format_args!("Total ({})", quote_name)),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:.5}", total_converted),
+                fmt_val_nopad(&total_converted, prec),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -590,10 +602,11 @@ fn render_orders(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: &
         }
     };
 
+    let prec = engine.get_precision();
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::from(vec![
-        Span::styled("ID  Dir   Pair          Volume       Price       ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("ID    Dir     Pair                Volume            Price", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(Span::styled(
         "─".repeat(inner.width as usize),
@@ -621,11 +634,11 @@ fn render_orders(f: &mut ratatui::Frame, area: Rect, engine: &mut Rpte, state: &
                 };
 
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{:<3} ", brief.id), Style::default().fg(Color::White)),
-                    Span::styled(format!("{:<5} ", dir_str), Style::default().fg(dir_color)),
-                    Span::styled(format!("{:<13} ", pair_str), Style::default().fg(Color::Green)),
-                    Span::styled(format!("{:<12.5} ", brief.src_volume), Style::default().fg(Color::Yellow)),
-                    Span::styled(format!("{:<.5}", brief.price), Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{:<5} ", brief.id), Style::default().fg(Color::White)),
+                    Span::styled(format!("{:<6} ", dir_str), Style::default().fg(dir_color)),
+                    Span::styled(format!("{:<18} ", pair_str), Style::default().fg(Color::Green)),
+                    Span::styled(fmt_val(&brief.src_volume, prec, 16) + " ", Style::default().fg(Color::Yellow)),
+                    Span::styled(fmt_val_nopad(&brief.price, prec), Style::default().fg(Color::Yellow)),
                 ]));
             }
         }
@@ -973,6 +986,11 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 }
             };
 
+            if !engine.is_swap_allowed(src_token, dst_token) {
+                state.set_msg(format!("Trade not allowed: {} ↔ {} (whitelist restriction)", parts[1], parts[2]));
+                return;
+            }
+
             engine.make(account_id, src_token, dst_token, volume, price);
             state.set_msg(format!(
                 "Limit order placed: account #{} {}→{} vol={} price={}",
@@ -1014,6 +1032,11 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                     return;
                 }
             };
+
+            if !engine.is_swap_allowed(src_token, dst_token) {
+                state.set_msg(format!("Trade not allowed: {} ↔ {} (whitelist restriction)", parts[1], parts[2]));
+                return;
+            }
 
             engine.swap(account_id, src_token, dst_token, volume);
             state.set_msg(format!(
