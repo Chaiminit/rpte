@@ -477,27 +477,19 @@ fn render_kline(
     let title = format!("{}:{}  Price: {}  Prev Vol: {}", src_name, dst_name, price_str, vol_str);
     let title = format!("{}   [←→] views  [:] cmd", title);
 
-    // Convert candle data
+    // Convert candle data: 用 (high + low + close) / 3 的均值绘制
     let data: Vec<(f64, f64)> = state
         .candle_cache
         .iter()
-        .map(|c| (c.step_count as f64, c.close.to_f64().unwrap_or(0.0)))
-        .collect();
-    let err_low: Vec<f64> = state
-        .candle_cache
-        .iter()
-        .map(|c| c.close.to_f64().unwrap_or(0.0) - c.low.to_f64().unwrap_or(0.0))
-        .collect();
-    let err_high: Vec<f64> = state
-        .candle_cache
-        .iter()
-        .map(|c| c.high.to_f64().unwrap_or(0.0) - c.close.to_f64().unwrap_or(0.0))
+        .map(|c| {
+            let mean = (c.high + c.low + c.close) / Decimal::new(3, 0);
+            (c.step_count as f64, mean.to_f64().unwrap_or(0.0))
+        })
         .collect();
 
     let close_series = Series::new("")
         .data(data)
-        .color(Color::Cyan)
-        .y_err_asymmetric(err_low, err_high);
+        .color(Color::Cyan);
 
     let plot = LinePlot::new()
         .series(close_series)

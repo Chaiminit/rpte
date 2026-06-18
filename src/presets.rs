@@ -11,65 +11,65 @@ use crate::node::{Node, Msg, EngineReader, ContractFn, CalledFn};
 use crate::contract::Contract;
 
 // ═══════════════════════════════════════════════════════════════
-//  借贷合约预设（Lending Contract Preset）
+//  借贷合约预设（Lending Contract Preset）— 双向模型
 // ═══════════════════════════════════════════════════════════════
 //
-// 模型：池化借贷
-//   - 存款人存入资产代币 → 获得资产凭证代币（享有利息）
-//   - 借款人存入质押代币 → 获得质押凭证代币（获得借款额度）
-//   - 借款人可借出资产代币，支付利息
-//   - 质押率低于清算阈值时触发清算
+// 模型：双池交叉质押借贷（浮动汇率 + 负债凭证）
 //
-// 两个 on_called 函数：
-//   0: 资产代币 ↔ 资产凭证代币 交换 (存款/取款/借款)
-//   1: 质押代币 ↔ 质押凭证代币 交换 (存入/取出质押品)
+//   代币体系（on_create 自动注册）：
+//     - aUSDT（资产池 A 凭证）：浮动汇率 = 池 A 总价值 / 发行量
+//     - aBTC（资产池 B 凭证）：浮动汇率 = 池 B 总价值 / 发行量
+//     - dUSDT（负债凭证 A）：始终 1:1，负值 = 欠 USDT
+//     - dBTC（负债凭证 B）：始终 1:1，负值 = 欠 BTC
 //
-// on_update：
-//   - 按利用率生成动态利率
-//   - 向借款人计收利息（累加到 total_borrowed）
-//   - 清算低于阈值的头寸
+//   四个 on_called 函数：
+//     0: aUSDT/USDT    池 A 存款/取款
+//     1: aBTC/BTC      池 B 存款/取款
+//     2: dUSDT/USDT    USDT 借款/还款（交叉质押）
+//     3: dBTC/BTC      BTC 借款/还款（交叉质押）
 //
-// 合约状态编码在 balance sheet 中：
-//   - sheet[asset_token]             = 合约持有的资产池总量
-//   - sheet[collateral_token]        = 合约持有的质押池总量
-//   - sheet[TOTAL_BORROWED]          = 总借款额
-//   - sheet[DEBT_BASE + account_id]  = 该账户的借款额
-//   - sheet[KEY_ASSET_RECEIPT_ID]    = 资产凭证代币 ID（缓存）
-//   - sheet[KEY_COLLATERAL_RECEIPT_ID] = 质押凭证代币 ID（缓存）
+//   交叉质押：质押价值 = aUSDT 池价值 + aBTC 池价值，总负债 = dUSDT + dBTC 换算
+//
+//   on_update：
+//     - 按利用率生成双池动态利率
+//     - 向借款人铸造更多负 dUSDT/dBTC 计息
+//     - 交叉质押清算（总权益 vs 总负债）
 // ═══════════════════════════════════════════════════════════════
 
-/// 合约内置状态 sentinel key：总借款额
-const KEY_TOTAL_BORROWED: usize = usize::MAX;
-/// 合约内置状态 sentinel key：资产凭证代币 ID 缓存
+/// 合约内置状态 sentinel key：aUSDT ID 缓存
 const KEY_ASSET_RECEIPT_ID: usize = usize::MAX - 1;
-/// 合约内置状态 sentinel key：质押凭证代币 ID 缓存
+/// 合约内置状态 sentinel key：aBTC ID 缓存
 const KEY_COLLATERAL_RECEIPT_ID: usize = usize::MAX - 2;
-/// 合约内置状态 sentinel base：DEBT_BASE + account_id → 该账户借款额
-const DEBT_BASE: usize = usize::MAX / 2;
+/// 合约内置状态 sentinel key：dUSDT ID 缓存
+const KEY_DEBT_RECEIPT_ID: usize = usize::MAX - 3;
+/// 合约内置状态 sentinel key：dBTC ID 缓存
+const KEY_DEBT_RECEIPT_ID_B: usize = usize::MAX - 4;
+/// 合约报价存储 key base：PRICE_BASE + fn_id → 该 fn 对应的虚拟交易对报价
+const PRICE_BASE: usize = usize::MAX / 4;
 
-/// 借贷合约配置参数
+/// 双向借贷合约配置参数
 #[derive(Clone)]
 pub struct LendingPreset {
-    /// 资产代币（借出/存款的代币，如 USDT）
-    pub asset_token: usize,
-    /// 质押代币（作为抵押品的代币，如 BTC）
-    pub collateral_token: usize,
-    /// 资产凭证代币名称（on_create 时自动注册）
-    pub asset_receipt_name: String,
-    /// 质押凭证代币名称（on_create 时自动注册）
-    pub collateral_receipt_name: String,
+    /// 资产代币 A（如 USDT）
+    pub asset_token_a: usize,
+    /// 资产代币 B（如 BTC）
+    pub asset_token_b: usize,
+    /// 存款凭证 A 名称（如 aUSDT）
+    pub receipt_a_name: String,
+    /// 存款凭证 B 名称（如 aBTC）
+    pub receipt_b_name: String,
+    /// 负债凭证 A 名称（如 dUSDT）
+    pub debt_a_name: String,
+    /// 负债凭证 B 名称（如 dBTC）
+    pub debt_b_name: String,
     /// 最低质押率（如 1.50 = 150%）
     pub min_collateral_ratio: Decimal,
-    /// 清算阈值（低于此值触发清算，如 1.30 = 130%）
+    /// 清算阈值（低于此值触发清算，如 1.20 = 120%）
     pub liquidation_threshold: Decimal,
-    // ── 利率模型参数（Compound 风格分段线性） ──
-    /// 最优利用率 (0.0 ~ 1.0)，默认 0.80
+    // ── 利率模型参数（共用，按各自池利用率计算） ──
     pub optimal_utilization: Decimal,
-    /// 基础利率（按帧），默认 0.001 / 帧
     pub base_rate: Decimal,
-    /// 斜率 1（利用率 < optimal），默认 0.02 / 帧
     pub slope1: Decimal,
-    /// 斜率 2（利用率 >= optimal），默认 0.50 / 帧
     pub slope2: Decimal,
 }
 
@@ -92,191 +92,313 @@ fn cached_receipt_id(
 }
 
 impl LendingPreset {
-    /// 创建借贷合约预设，使用默认利率参数。
-    ///
-    /// `asset_receipt_name` / `collateral_receipt_name` 是凭证代币名称，
-    /// 会在 `on_create` 中自动注册为不可交易代币，并通过 `virtual_anchor` 与对应基础代币价值绑定。
-    pub fn new(
-        asset_token: usize,
-        collateral_token: usize,
-        asset_receipt_name: &str,
-        collateral_receipt_name: &str,
+    /// 创建双向借贷合约预设。
+    pub fn new_bidirectional(
+        asset_token_a: usize,
+        asset_token_b: usize,
+        receipt_a_name: &str,
+        receipt_b_name: &str,
+        debt_a_name: &str,
+        debt_b_name: &str,
         min_collateral_ratio: Decimal,
         liquidation_threshold: Decimal,
     ) -> Self {
         Self {
-            asset_token,
-            collateral_token,
-            asset_receipt_name: asset_receipt_name.to_string(),
-            collateral_receipt_name: collateral_receipt_name.to_string(),
+            asset_token_a,
+            asset_token_b,
+            receipt_a_name: receipt_a_name.to_string(),
+            receipt_b_name: receipt_b_name.to_string(),
+            debt_a_name: debt_a_name.to_string(),
+            debt_b_name: debt_b_name.to_string(),
             min_collateral_ratio,
             liquidation_threshold,
-            optimal_utilization: Decimal::new(8, 1), // 0.8
-            base_rate:          Decimal::new(1, 3),  // 0.001
-            slope1:             Decimal::new(2, 3),  // 0.002
-            slope2:             Decimal::new(5, 1),  // 0.5
+            optimal_utilization: Decimal::new(8, 1),  // 0.8
+            base_rate:          Decimal::new(28, 7),  // 0.00000028 → ~5%/小时
+            slope1:             Decimal::new(28, 7),  // 0.00000028 → 最优(80%利用率)时总计~10%/小时
+            slope2:             Decimal::new(15, 6),  // 0.0000015  → 100%利用率时总计~37%/小时
         }
     }
 
     /// 构建合约行为函数，返回 `(on_create, on_update, on_end, on_called_fns)`。
     pub fn build(&self) -> (ContractFn, ContractFn, ContractFn, Vec<CalledFn>) {
-        // ── 按名称注册凭证代币 ──
+        // ── on_create：注册四种凭证代币 + 创建 4 个虚拟交易对 ──
         let p_create = self.clone();
         let on_create: ContractFn = Arc::new(move |_contract: &mut Contract, _reader: &dyn EngineReader, _step: u64| -> Vec<Msg> {
             vec![
+                // 存款凭证 A（aUSDT）
                 Msg::RegisterToken {
-                    name: p_create.asset_receipt_name.clone(),
+                    name: p_create.receipt_a_name.clone(),
                     can_be_negative: false,
-                    not_tradable: true,
-                    virtual_anchor: Some(p_create.asset_token),
-                    swap_whitelist: Vec::new(),
                 },
+                // 存款凭证 B（aBTC）
                 Msg::RegisterToken {
-                    name: p_create.collateral_receipt_name.clone(),
+                    name: p_create.receipt_b_name.clone(),
                     can_be_negative: false,
-                    not_tradable: true,
-                    virtual_anchor: Some(p_create.collateral_token),
-                    swap_whitelist: Vec::new(),
+                },
+                // 负债凭证 A（dUSDT）
+                Msg::RegisterToken {
+                    name: p_create.debt_a_name.clone(),
+                    can_be_negative: true,
+                },
+                // 负债凭证 B（dBTC）
+                Msg::RegisterToken {
+                    name: p_create.debt_b_name.clone(),
+                    can_be_negative: true,
+                },
+                // fn_id=0: aUSDT/USDT 虚拟对（浮动汇率，允许限价单）
+                Msg::CreateVirtualPair {
+                    contract_slave_id: _contract.id,
+                    fn_id: 0,
+                    quote_token: p_create.asset_token_a,
+                    base_token_name: p_create.receipt_a_name.clone(),
+                    swap_only: false,
+                },
+                // fn_id=1: aBTC/BTC 虚拟对（浮动汇率，允许限价单）
+                Msg::CreateVirtualPair {
+                    contract_slave_id: _contract.id,
+                    fn_id: 1,
+                    quote_token: p_create.asset_token_b,
+                    base_token_name: p_create.receipt_b_name.clone(),
+                    swap_only: false,
+                },
+                // fn_id=2: dUSDT/USDT 虚拟对（固定 1:1，只许市价单）
+                Msg::CreateVirtualPair {
+                    contract_slave_id: _contract.id,
+                    fn_id: 2,
+                    quote_token: p_create.asset_token_a,
+                    base_token_name: p_create.debt_a_name.clone(),
+                    swap_only: true,
+                },
+                // fn_id=3: dBTC/BTC 虚拟对（固定 1:1，只许市价单）
+                Msg::CreateVirtualPair {
+                    contract_slave_id: _contract.id,
+                    fn_id: 3,
+                    quote_token: p_create.asset_token_b,
+                    base_token_name: p_create.debt_b_name.clone(),
+                    swap_only: true,
                 },
             ]
         });
 
-        // ── on_update：利率生成、利息结算、清算 ──
+        // ── on_update：利率生成、利息结算（双池）、交叉质押清算 ──
         let p_up = self.clone();
         let on_update: ContractFn = Arc::new(move |contract: &mut Contract, reader: &dyn EngineReader, _step: u64| -> Vec<Msg> {
             let prec = reader.precision();
             let round = |v: Decimal| v.round_dp_with_strategy(prec as u32, RoundingStrategy::ToZero);
+            let mut msgs = Vec::new();
 
-            let asset_token = p_up.asset_token;
-            let collateral_token = p_up.collateral_token;
+            let token_a = p_up.asset_token_a;
+            let token_b = p_up.asset_token_b;
 
-            // 读取凭证代币 ID（需要先完成注册）
-            let collateral_receipt_token = match cached_receipt_id(
-                contract, reader, &p_up.collateral_receipt_name, KEY_COLLATERAL_RECEIPT_ID,
-            ) {
-                Some(id) => id,
-                None => return Vec::new(), // 尚未注册，跳过此帧
+            // 读取凭证代币 ID
+            let receipt_a = match cached_receipt_id(contract, reader, &p_up.receipt_a_name, KEY_ASSET_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let receipt_b = match cached_receipt_id(contract, reader, &p_up.receipt_b_name, KEY_COLLATERAL_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let debt_a = match cached_receipt_id(contract, reader, &p_up.debt_a_name, KEY_DEBT_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let debt_b = match cached_receipt_id(contract, reader, &p_up.debt_b_name, KEY_DEBT_RECEIPT_ID_B) {
+                Some(id) => id, None => return Vec::new(),
             };
 
-            // 读取当前池状态
-            let total_asset_pool = contract.balance(asset_token);
-            let total_collateral_pool = contract.balance(collateral_token);
-            let total_borrowed = contract.balance(KEY_TOTAL_BORROWED);
+            // ── 1. 双池利率计算与利息结算 ──
+            let pool_a_cash = contract.balance(token_a);
+            let pool_b_cash = contract.balance(token_b);
 
-            // ── 1. 利率计算与利息结算 ──
-            let pool_total = total_asset_pool + total_borrowed;
-            let msgs = if !pool_total.is_zero() && !total_borrowed.is_zero() {
-                let utilization = total_borrowed / pool_total;
-                let rate = if utilization < p_up.optimal_utilization {
-                    let slope = if p_up.optimal_utilization.is_zero() {
-                        Decimal::ZERO
-                    } else {
-                        p_up.slope1 * utilization / p_up.optimal_utilization
-                    };
-                    p_up.base_rate + slope
-                } else {
-                    let one_minus_optimal = Decimal::ONE - p_up.optimal_utilization;
-                    let slope = if one_minus_optimal.is_zero() {
-                        Decimal::ZERO
-                    } else {
-                        p_up.slope2 * (utilization - p_up.optimal_utilization) / one_minus_optimal
-                    };
-                    p_up.base_rate + p_up.slope1 + slope
-                };
+            let debt_a_total_supply = reader.token_total_supply(debt_a);
+            let debt_b_total_supply = reader.token_total_supply(debt_b);
+            let borrowed_a = if debt_a_total_supply < Decimal::ZERO { -debt_a_total_supply } else { Decimal::ZERO };
+            let borrowed_b = if debt_b_total_supply < Decimal::ZERO { -debt_b_total_supply } else { Decimal::ZERO };
 
-                let interest = round(total_borrowed * rate);
-                if interest > Decimal::ZERO {
-                    let new_borrowed = total_borrowed + interest;
-                    contract.set_balance(KEY_TOTAL_BORROWED, new_borrowed);
-                }
-                Vec::new()
-            } else {
-                Vec::new()
-            };
-
-            // ── 2. 清算低于清算阈值的头寸 ──
-            if total_collateral_pool.is_zero() {
-                return msgs;
-            }
-
-            let all_accounts = reader.get_all_accounts();
-            let mut liq_msgs: Vec<Msg> = Vec::new();
-
-            for &account_id in &all_accounts {
-                let debt = contract.balance(DEBT_BASE + account_id);
-                if debt <= Decimal::ZERO {
-                    continue;
-                }
-
-                let collateral_receipt_balance = reader.node_balance(account_id, collateral_receipt_token);
-                if collateral_receipt_balance <= Decimal::ZERO {
-                    // 没有质押凭证但仍欠债 → 坏账，直接清零
-                    contract.set_balance(DEBT_BASE + account_id, Decimal::ZERO);
-                    let cur = contract.balance(KEY_TOTAL_BORROWED);
-                    contract.set_balance(KEY_TOTAL_BORROWED, (cur - debt).max(Decimal::ZERO));
-                    continue;
-                }
-
-                let total_collateral_receipt = reader.token_total_supply(collateral_receipt_token);
-                let account_collateral_share = if total_collateral_receipt.is_zero() {
-                    Decimal::ZERO
-                } else {
-                    total_collateral_pool * collateral_receipt_balance / total_collateral_receipt
-                };
-
-                let collateral_value = reader.convert_value(collateral_token, asset_token, account_collateral_share);
-
-                if collateral_value <= Decimal::ZERO || debt <= Decimal::ZERO {
-                    continue;
-                }
-                let health = collateral_value / debt;
-
-                if health < p_up.liquidation_threshold {
-                    // ── 触发清算 ──
-                    liq_msgs.push(Msg::Issue {
-                        token: collateral_receipt_token,
-                        account_id,
-                        volume: -collateral_receipt_balance,
-                    });
-
-                    let penalty = round(debt * Decimal::new(5, 2)); // 5% 清算惩罚
-                    let needed_asset = debt + penalty;
-
-                    let price_opt = reader.price_between(collateral_token, asset_token);
-                    let swap_collateral_amount = if let Some((price, quote, _base)) = price_opt {
-                        if price.is_zero() {
-                            account_collateral_share
-                        } else if quote == collateral_token {
-                            round(needed_asset * price)
-                        } else {
-                            if price.is_zero() { account_collateral_share }
-                            else { round(needed_asset / price) }
-                        }
-                    } else {
-                        account_collateral_share
-                    };
-
-                    let swap_amount = swap_collateral_amount.min(account_collateral_share);
-
-                    if swap_amount > Decimal::ZERO {
-                        liq_msgs.push(Msg::SwapOrder {
-                            src_id: contract.id,
-                            owner_node_id: contract.id,
-                            src_token: collateral_token,
-                            dst_token: asset_token,
-                            volume: swap_amount,
-                        });
+            // 池 A 利率
+            let pool_a_total = pool_a_cash + borrowed_a;
+            if !pool_a_total.is_zero() && !borrowed_a.is_zero() {
+                let util = borrowed_a / pool_a_total;
+                let rate = p_up._calc_rate(util);
+                let all_accounts = reader.get_all_accounts();
+                for &acc in &all_accounts {
+                    let bal = reader.node_balance(acc, debt_a);
+                    if bal >= Decimal::ZERO { continue; }
+                    let debt = -bal;
+                    let interest = round(debt * rate).max(Decimal::new(1, prec as u32));
+                    if interest > Decimal::ZERO {
+                        msgs.push(Msg::Issue { token: debt_a, account_id: acc, volume: -interest });
                     }
-
-                    contract.set_balance(DEBT_BASE + account_id, Decimal::ZERO);
-                    let cur_total = contract.balance(KEY_TOTAL_BORROWED);
-                    contract.set_balance(KEY_TOTAL_BORROWED, (cur_total - debt).max(Decimal::ZERO));
                 }
             }
 
-            let mut all = msgs;
-            all.extend(liq_msgs);
-            all
+            // 池 B 利率
+            let pool_b_total = pool_b_cash + borrowed_b;
+            if !pool_b_total.is_zero() && !borrowed_b.is_zero() {
+                let util = borrowed_b / pool_b_total;
+                let rate = p_up._calc_rate(util);
+                let all_accounts = reader.get_all_accounts();
+                for &acc in &all_accounts {
+                    let bal = reader.node_balance(acc, debt_b);
+                    if bal >= Decimal::ZERO { continue; }
+                    let debt = -bal;
+                    let interest = round(debt * rate).max(Decimal::new(1, prec as u32));
+                    if interest > Decimal::ZERO {
+                        msgs.push(Msg::Issue { token: debt_b, account_id: acc, volume: -interest });
+                    }
+                }
+            }
+
+            // ── 2. 交叉质押清算 ──
+            // 遍历有负债的账户，计算总质押价值 vs 总负债
+            let all_accounts = reader.get_all_accounts();
+            for &acc in &all_accounts {
+                let d_a_bal = reader.node_balance(acc, debt_a);
+                let d_b_bal = reader.node_balance(acc, debt_b);
+                if d_a_bal >= Decimal::ZERO && d_b_bal >= Decimal::ZERO {
+                    continue; // 无任何负债
+                }
+                let debt_a_amt = if d_a_bal < Decimal::ZERO { -d_a_bal } else { Decimal::ZERO };
+                let debt_b_amt = if d_b_bal < Decimal::ZERO { -d_b_bal } else { Decimal::ZERO };
+
+                // 计算总负债（以 USDT 计价）
+                let debt_b_in_usdt = reader.convert_value(token_b, token_a, debt_b_amt);
+                let total_debt = debt_a_amt + debt_b_in_usdt;
+                if total_debt <= Decimal::ZERO { continue; }
+
+                // 计算总质押价值 = aUSDT 池份额 + aBTC 池份额（以 USDT 计价）
+                let r_a_bal = reader.node_balance(acc, receipt_a);
+                let r_b_bal = reader.node_balance(acc, receipt_b);
+
+                let r_a_supply = reader.token_total_supply(receipt_a);
+                let r_b_supply = reader.token_total_supply(receipt_b);
+
+                let a_share = if r_a_supply.is_zero() { Decimal::ZERO }
+                    else { (pool_a_cash + borrowed_a) * r_a_bal / r_a_supply };
+                let b_share = if r_b_supply.is_zero() { Decimal::ZERO }
+                    else { (pool_b_cash + borrowed_b) * r_b_bal / r_b_supply };
+
+                let a_share_in_usdt = reader.convert_value(token_a, token_a, a_share); // 本身就是 USDT
+                let b_share_in_usdt = reader.convert_value(token_b, token_a, b_share);
+                let total_collateral = a_share_in_usdt + b_share_in_usdt;
+
+                if total_collateral <= Decimal::ZERO { continue; }
+
+                let health = total_collateral / total_debt;
+                if health >= p_up.liquidation_threshold { continue; }
+
+                // ── 触发清算：销毁全部存款凭证，差额的一半由对方池通过市场 swap 补足 ──
+                let btc_price = reader.convert_value(token_b, token_a, Decimal::ONE);
+
+                // 计算各池被没收的份额价值
+                let seized_a = if r_a_supply.is_zero() || r_a_bal.is_zero() { Decimal::ZERO }
+                    else { (pool_a_cash + borrowed_a) * r_a_bal / r_a_supply };
+                let seized_b_btc = if r_b_supply.is_zero() || r_b_bal.is_zero() { Decimal::ZERO }
+                    else { (pool_b_cash + borrowed_b) * r_b_bal / r_b_supply };
+
+                // 销毁所有存款凭证
+                if r_a_bal > Decimal::ZERO {
+                    msgs.push(Msg::Issue { token: receipt_a, account_id: acc, volume: -r_a_bal });
+                }
+                if r_b_bal > Decimal::ZERO {
+                    msgs.push(Msg::Issue { token: receipt_b, account_id: acc, volume: -r_b_bal });
+                }
+
+                // 计算各池净额（正 = 超额，负 = 短缺）
+                let half_net_a = round((seized_a - debt_a_amt) / Decimal::new(2, 0));   // USDT
+                let half_net_b_btc = round((seized_b_btc - debt_b_amt) / Decimal::new(2, 0)); // BTC
+
+                // 各池超额/短缺的一半通过市场 swap 与对方池共享
+                if btc_price > Decimal::ZERO {
+                    // A 池超额 → 卖 USDT 买 BTC，分给 B 池
+                    if half_net_a > Decimal::ZERO {
+                        let swap_usdt = half_net_a.min(pool_a_cash);
+                        if swap_usdt > Decimal::ZERO {
+                            msgs.push(Msg::SwapOrder {
+                                src_id: contract.id,
+                                owner_node_id: contract.id,
+                                src_token: token_a,
+                                dst_token: token_b,
+                                volume: swap_usdt,
+                            });
+                        }
+                    }
+                    // B 池超额 → 卖 BTC 买 USDT，分给 A 池
+                    if half_net_b_btc > Decimal::ZERO {
+                        let swap_btc = half_net_b_btc.min(pool_b_cash);
+                        if swap_btc > Decimal::ZERO {
+                            msgs.push(Msg::SwapOrder {
+                                src_id: contract.id,
+                                owner_node_id: contract.id,
+                                src_token: token_b,
+                                dst_token: token_a,
+                                volume: swap_btc,
+                            });
+                        }
+                    }
+                    // A 池短缺 → 从 B 池调（卖 BTC 买 USDT）
+                    if half_net_a < Decimal::ZERO {
+                        let need_usdt = -half_net_a;
+                        let swap_btc = round(need_usdt / btc_price).min(pool_b_cash);
+                        if swap_btc > Decimal::ZERO {
+                            msgs.push(Msg::SwapOrder {
+                                src_id: contract.id,
+                                owner_node_id: contract.id,
+                                src_token: token_b,
+                                dst_token: token_a,
+                                volume: swap_btc,
+                            });
+                        }
+                    }
+                    // B 池短缺 → 从 A 池调（卖 USDT 买 BTC）
+                    if half_net_b_btc < Decimal::ZERO {
+                        let need_btc = -half_net_b_btc;
+                        let swap_usdt = round(need_btc * btc_price).min(pool_a_cash);
+                        if swap_usdt > Decimal::ZERO {
+                            msgs.push(Msg::SwapOrder {
+                                src_id: contract.id,
+                                owner_node_id: contract.id,
+                                src_token: token_a,
+                                dst_token: token_b,
+                                volume: swap_usdt,
+                            });
+                        }
+                    }
+                }
+
+                // 清零所有负债
+                if d_a_bal < Decimal::ZERO {
+                    msgs.push(Msg::Issue { token: debt_a, account_id: acc, volume: -d_a_bal });
+                }
+                if d_b_bal < Decimal::ZERO {
+                    msgs.push(Msg::Issue { token: debt_b, account_id: acc, volume: -d_b_bal });
+                }
+            }
+
+            // ── 3. 写入虚拟交易对报价 ──
+            // fn_id=0: aUSDT 汇率
+            let r_a_supply = reader.token_total_supply(receipt_a);
+            let rate_a = if r_a_supply.is_zero() { Decimal::ONE }
+            else {
+                let pv = pool_a_cash + borrowed_a;
+                if pv.is_zero() { Decimal::ONE } else { pv / r_a_supply }
+            };
+            contract.set_balance(PRICE_BASE, rate_a);
+
+            // fn_id=1: aBTC 汇率
+            let r_b_supply = reader.token_total_supply(receipt_b);
+            let rate_b = if r_b_supply.is_zero() { Decimal::ONE }
+            else {
+                let pv = pool_b_cash + borrowed_b;
+                if pv.is_zero() { Decimal::ONE } else { pv / r_b_supply }
+            };
+            contract.set_balance(PRICE_BASE + 1, rate_b);
+
+            // fn_id=2: dUSDT/USDT = 1:1
+            contract.set_balance(PRICE_BASE + 2, Decimal::ONE);
+
+            // fn_id=3: dBTC/BTC = 1:1
+            contract.set_balance(PRICE_BASE + 3, Decimal::ONE);
+
+            msgs
         });
 
         // ── on_end：合约结束，无特殊操作 ──
@@ -284,283 +406,319 @@ impl LendingPreset {
             Vec::new()
         });
 
-        // ── on_called[0]：资产代币 ↔ 资产凭证代币 ──
+        // ── on_called[0]：aUSDT ↔ USDT 存款/取款（浮动汇率） ──
         let p0 = self.clone();
-        let exchange_asset: CalledFn = Arc::new(move |contract: &mut Contract, reader: &dyn EngineReader, caller_id: usize, volume: Decimal| -> Vec<Msg> {
-            if volume.is_zero() {
-                return Vec::new();
-            }
-
-            // 读取凭证代币 ID
-            let asset_receipt_token = match cached_receipt_id(
-                contract, reader, &p0.asset_receipt_name, KEY_ASSET_RECEIPT_ID,
-            ) {
-                Some(id) => id,
-                None => return Vec::new(),
+        let exchange_a: CalledFn = Arc::new(move |contract: &mut Contract, reader: &dyn EngineReader, caller_id: usize, volume: Decimal| -> Vec<Msg> {
+            if volume.is_zero() { return Vec::new(); }
+            let receipt_a = match cached_receipt_id(contract, reader, &p0.receipt_a_name, KEY_ASSET_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
             };
-
+            let debt_a = match cached_receipt_id(contract, reader, &p0.debt_a_name, KEY_DEBT_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
             let prec = reader.precision();
             let round = |v: Decimal| v.round_dp_with_strategy(prec as u32, RoundingStrategy::ToZero);
-            let mut msgs = Vec::new();
+            let token = p0.asset_token_a;
+            let mut res = Vec::new();
 
-            let asset_token = p0.asset_token;
-            let collateral_token = p0.collateral_token;
-
-            // 计算资产凭证汇率: rate = (总资产池 + 总借款) / 总凭证发行量
-            let total_asset_pool = contract.balance(asset_token);
-            let total_borrowed = contract.balance(KEY_TOTAL_BORROWED);
-            let total_receipt_supply = reader.token_total_supply(asset_receipt_token);
-            let rate = if total_receipt_supply.is_zero() {
-                Decimal::ONE
-            } else {
-                let pool_value = total_asset_pool + total_borrowed;
-                if pool_value.is_zero() {
-                    Decimal::ONE
-                } else {
-                    pool_value / total_receipt_supply
-                }
+            // 计算 aUSDT 汇率
+            let pool_cash = contract.balance(token);
+            let d_supply = reader.token_total_supply(debt_a);
+            let borrowed = if d_supply < Decimal::ZERO { -d_supply } else { Decimal::ZERO };
+            let r_supply = reader.token_total_supply(receipt_a);
+            let rate = if r_supply.is_zero() { Decimal::ONE }
+            else {
+                let pv = pool_cash + borrowed;
+                if pv.is_zero() { Decimal::ONE } else { pv / r_supply }
             };
 
             if volume > Decimal::ZERO {
-                // ── 存款：转入 volume 资产代币，铸造凭证 ──
-                let caller_asset_bal = reader.node_balance(caller_id, asset_token);
-                if caller_asset_bal < volume {
-                    return Vec::new();
-                }
-
-                let receipt_amount = if rate.is_zero() { volume } else { round(volume / rate) };
-                if receipt_amount <= Decimal::ZERO {
-                    return Vec::new();
-                }
-
-                msgs.push(Msg::Transfer {
-                    src_id: caller_id,
-                    dst_id: contract.id,
-                    token: asset_token,
-                    volume,
-                });
-                msgs.push(Msg::Issue {
-                    token: asset_receipt_token,
-                    account_id: caller_id,
-                    volume: receipt_amount,
-                });
+                // 存款：转入 volume USDT，铸造 aUSDT
+                let caller_bal = reader.node_balance(caller_id, token);
+                if caller_bal < volume { return Vec::new(); }
+                let receipt_amt = if rate.is_zero() { volume } else { round(volume / rate) };
+                if receipt_amt <= Decimal::ZERO { return Vec::new(); }
+                res.push(Msg::Transfer { src_id: caller_id, dst_id: contract.id, token, volume });
+                res.push(Msg::Issue { token: receipt_a, account_id: caller_id, volume: receipt_amt });
             } else {
-                // ── volume < 0：取款 或 借款 ──
-                let withdraw_amount = -volume;
-                let caller_receipt_bal = reader.node_balance(caller_id, asset_receipt_token);
-
-                let max_withdraw_from_receipt = if rate.is_zero() {
-                    caller_receipt_bal
-                } else {
-                    round(caller_receipt_bal * rate)
-                };
-
-                if withdraw_amount <= max_withdraw_from_receipt {
-                    // ── 纯取款 ──
-                    // 检查池中流动性是否充足
-                    if contract.balance(asset_token) < withdraw_amount {
-                        return Vec::new();
-                    }
-
-                    let receipt_needed = if rate.is_zero() {
-                        round(withdraw_amount)
-                    } else {
-                        round(withdraw_amount / rate)
-                    };
-                    let receipt_to_burn = receipt_needed.min(caller_receipt_bal);
-
-                    msgs.push(Msg::Issue {
-                        token: asset_receipt_token,
-                        account_id: caller_id,
-                        volume: -receipt_to_burn,
-                    });
-                    msgs.push(Msg::Transfer {
-                        src_id: contract.id,
-                        dst_id: caller_id,
-                        token: asset_token,
-                        volume: withdraw_amount,
-                    });
-                } else {
-                    // ── 取款超出凭证额度 → 超出部分视为借款 ──
-                    let deposit_part = max_withdraw_from_receipt;
-                    let borrow_part = withdraw_amount - deposit_part;
-
-                    // 检查借款人的质押品是否充足
-                    let collateral_receipt_token = match cached_receipt_id(
-                        contract, reader, &p0.collateral_receipt_name, KEY_COLLATERAL_RECEIPT_ID,
-                    ) {
-                        Some(id) => id,
-                        None => return Vec::new(),
-                    };
-                    let caller_collateral_receipt = reader.node_balance(caller_id, collateral_receipt_token);
-                    let total_collateral_receipt = reader.token_total_supply(collateral_receipt_token);
-                    let total_collateral_pool = contract.balance(collateral_token);
-
-                    let account_collateral_share = if total_collateral_receipt.is_zero() {
-                        Decimal::ZERO
-                    } else {
-                        total_collateral_pool * caller_collateral_receipt / total_collateral_receipt
-                    };
-
-                    let existing_debt = contract.balance(DEBT_BASE + caller_id);
-                    let collateral_value = reader.convert_value(collateral_token, asset_token, account_collateral_share);
-
-                    let total_debt = existing_debt + borrow_part;
-                    if collateral_value <= Decimal::ZERO || p0.min_collateral_ratio <= Decimal::ZERO {
-                        return Vec::new();
-                    }
-                    if total_debt * p0.min_collateral_ratio > collateral_value {
-                        return Vec::new(); // 质押率不足
-                    }
-
-                    // 检查池中流动性是否充足
-                    if contract.balance(asset_token) < withdraw_amount {
-                        return Vec::new();
-                    }
-
-                    // 销毁凭证（取回自有存款部分）
-                    let receipt_to_burn = if rate.is_zero() {
-                        round(deposit_part)
-                    } else {
-                        round(deposit_part / rate)
-                    };
-                    let receipt_to_burn = receipt_to_burn.min(caller_receipt_bal);
-                    if receipt_to_burn > Decimal::ZERO {
-                        msgs.push(Msg::Issue {
-                            token: asset_receipt_token,
-                            account_id: caller_id,
-                            volume: -receipt_to_burn,
-                        });
-                    }
-
-                    msgs.push(Msg::Transfer {
-                        src_id: contract.id,
-                        dst_id: caller_id,
-                        token: asset_token,
-                        volume: withdraw_amount,
-                    });
-
-                    // 记录借款
-                    let new_debt = existing_debt + borrow_part;
-                    contract.set_balance(DEBT_BASE + caller_id, new_debt);
-                    contract.set_balance(KEY_TOTAL_BORROWED, total_borrowed + borrow_part);
-                }
+                // 取款：销毁 aUSDT，取出 USDT
+                let withdraw = -volume;
+                let caller_receipt = reader.node_balance(caller_id, receipt_a);
+                let max_w = if rate.is_zero() { caller_receipt } else { round(caller_receipt * rate) };
+                let mut actual = withdraw.min(max_w);
+                let pool_bal = contract.balance(token);
+                actual = actual.min(pool_bal);
+                if actual <= Decimal::ZERO { return Vec::new(); }
+                let needed = if rate.is_zero() { round(actual) } else { round(actual / rate) };
+                let to_burn = needed.min(caller_receipt);
+                res.push(Msg::Issue { token: receipt_a, account_id: caller_id, volume: -to_burn });
+                res.push(Msg::Transfer { src_id: contract.id, dst_id: caller_id, token, volume: actual });
             }
-
-            msgs
+            res
         });
 
-        // ── on_called[1]：质押代币 ↔ 质押凭证代币 ──
+        // ── on_called[1]：aBTC ↔ BTC 存款/取款（浮动汇率） ──
         let p1 = self.clone();
-        let exchange_collateral: CalledFn = Arc::new(move |contract: &mut Contract, reader: &dyn EngineReader, caller_id: usize, volume: Decimal| -> Vec<Msg> {
-            if volume.is_zero() {
-                return Vec::new();
-            }
-
-            // 读取凭证代币 ID
-            let collateral_receipt_token = match cached_receipt_id(
-                contract, reader, &p1.collateral_receipt_name, KEY_COLLATERAL_RECEIPT_ID,
-            ) {
-                Some(id) => id,
-                None => return Vec::new(),
+        let exchange_b: CalledFn = Arc::new(move |contract: &mut Contract, reader: &dyn EngineReader, caller_id: usize, volume: Decimal| -> Vec<Msg> {
+            if volume.is_zero() { return Vec::new(); }
+            let receipt_b = match cached_receipt_id(contract, reader, &p1.receipt_b_name, KEY_COLLATERAL_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
             };
-
+            let debt_b = match cached_receipt_id(contract, reader, &p1.debt_b_name, KEY_DEBT_RECEIPT_ID_B) {
+                Some(id) => id, None => return Vec::new(),
+            };
             let prec = reader.precision();
             let round = |v: Decimal| v.round_dp_with_strategy(prec as u32, RoundingStrategy::ToZero);
-            let mut msgs = Vec::new();
+            let token = p1.asset_token_b;
+            let mut res = Vec::new();
 
-            let collateral_token = p1.collateral_token;
-            let asset_token = p1.asset_token;
-
-            // 计算质押凭证汇率: rate = 总质押池 / 总凭证发行量
-            let total_collateral_pool = contract.balance(collateral_token);
-            let total_receipt_supply = reader.token_total_supply(collateral_receipt_token);
-            let rate = if total_receipt_supply.is_zero() {
-                Decimal::ONE
-            } else if total_collateral_pool.is_zero() {
-                Decimal::ONE
-            } else {
-                total_collateral_pool / total_receipt_supply
+            // 计算 aBTC 汇率
+            let pool_cash = contract.balance(token);
+            let d_supply = reader.token_total_supply(debt_b);
+            let borrowed = if d_supply < Decimal::ZERO { -d_supply } else { Decimal::ZERO };
+            let r_supply = reader.token_total_supply(receipt_b);
+            let rate = if r_supply.is_zero() { Decimal::ONE }
+            else {
+                let pv = pool_cash + borrowed;
+                if pv.is_zero() { Decimal::ONE } else { pv / r_supply }
             };
 
             if volume > Decimal::ZERO {
-                // ── 存入质押品 ──
-                let caller_bal = reader.node_balance(caller_id, collateral_token);
-                if caller_bal < volume {
-                    return Vec::new();
-                }
-
-                let receipt_amount = if rate.is_zero() { volume } else { round(volume / rate) };
-                if receipt_amount <= Decimal::ZERO {
-                    return Vec::new();
-                }
-
-                msgs.push(Msg::Transfer {
-                    src_id: caller_id,
-                    dst_id: contract.id,
-                    token: collateral_token,
-                    volume,
-                });
-                msgs.push(Msg::Issue {
-                    token: collateral_receipt_token,
-                    account_id: caller_id,
-                    volume: receipt_amount,
-                });
+                // 存入 BTC
+                let caller_bal = reader.node_balance(caller_id, token);
+                if caller_bal < volume { return Vec::new(); }
+                let receipt_amt = if rate.is_zero() { volume } else { round(volume / rate) };
+                if receipt_amt <= Decimal::ZERO { return Vec::new(); }
+                res.push(Msg::Transfer { src_id: caller_id, dst_id: contract.id, token, volume });
+                res.push(Msg::Issue { token: receipt_b, account_id: caller_id, volume: receipt_amt });
             } else {
-                // ── volume < 0：取出质押品 ──
-                let withdraw_amount = -volume;
-                let caller_receipt_bal = reader.node_balance(caller_id, collateral_receipt_token);
-                let max_withdraw = if rate.is_zero() {
-                    caller_receipt_bal
-                } else {
-                    round(caller_receipt_bal * rate)
+                // 取出 BTC
+                let withdraw = -volume;
+                let caller_receipt = reader.node_balance(caller_id, receipt_b);
+                let max_w = if rate.is_zero() { caller_receipt } else { round(caller_receipt * rate) };
+                let mut actual = withdraw.min(max_w);
+                let pool_bal = contract.balance(token);
+                actual = actual.min(pool_bal);
+                if actual <= Decimal::ZERO { return Vec::new(); }
+
+                // 取出后保证总质押率满足要求（交叉质押检查）
+                let debt_a = match cached_receipt_id(contract, reader, &p1.debt_a_name, KEY_DEBT_RECEIPT_ID) {
+                    Some(id) => id, None => return Vec::new(),
                 };
+                let receipt_a = match cached_receipt_id(contract, reader, &p1.receipt_a_name, KEY_ASSET_RECEIPT_ID) {
+                    Some(id) => id, None => return Vec::new(),
+                };
+                let d_a_bal = reader.node_balance(caller_id, debt_a);
+                let d_b_bal = reader.node_balance(caller_id, debt_b);
+                let d_a_amt = if d_a_bal < Decimal::ZERO { -d_a_bal } else { Decimal::ZERO };
+                let d_b_amt = if d_b_bal < Decimal::ZERO { -d_b_bal } else { Decimal::ZERO };
+                let total_debt = d_a_amt + reader.convert_value(p1.asset_token_b, p1.asset_token_a, d_b_amt);
+                if total_debt > Decimal::ZERO {
+                    // 估算取后剩余的质押价值
+                    let needed = if rate.is_zero() { round(actual) } else { round(actual / rate) };
+                    let remaining_receipt_b = caller_receipt - needed;
+                    let r_a_bal = reader.node_balance(caller_id, receipt_a);
+                    let r_a_supply = reader.token_total_supply(receipt_a);
+                    let r_b_supply = reader.token_total_supply(receipt_b);
+                    let pool_a_cash = contract.balance(p1.asset_token_a);
+                    let pool_b_cash = contract.balance(p1.asset_token_b);
+                    let d_a_sup = reader.token_total_supply(debt_a);
+                    let d_b_sup = reader.token_total_supply(debt_b);
+                    let borrowed_a = if d_a_sup < Decimal::ZERO { -d_a_sup } else { Decimal::ZERO };
+                    let borrowed_b = if d_b_sup < Decimal::ZERO { -d_b_sup } else { Decimal::ZERO };
 
-                let actual_withdraw = withdraw_amount.min(max_withdraw);
-                if actual_withdraw <= Decimal::ZERO {
-                    return Vec::new();
-                }
-
-                // 取出后需保证仍满足质押率要求（如有借款）
-                let debt = contract.balance(DEBT_BASE + caller_id);
-                if debt > Decimal::ZERO {
-                    let receipt_to_burn_for_check = round(actual_withdraw / rate);
-                    let remaining_receipt_bal = caller_receipt_bal - receipt_to_burn_for_check;
-                    let account_share = if total_receipt_supply.is_zero() {
-                        Decimal::ZERO
-                    } else {
-                        (total_collateral_pool - actual_withdraw) * remaining_receipt_bal / total_receipt_supply
-                    };
-                    let collateral_value_after = reader.convert_value(collateral_token, asset_token, account_share);
-
-                    if debt * p1.min_collateral_ratio > collateral_value_after {
+                    let a_val = if r_a_supply.is_zero() { Decimal::ZERO }
+                        else { (pool_a_cash + borrowed_a) * r_a_bal / r_a_supply };
+                    let b_val = if r_b_supply.is_zero() { Decimal::ZERO }
+                        else { ((pool_b_cash + borrowed_b) - actual) * remaining_receipt_b / r_b_supply };
+                    let total_collateral = a_val + reader.convert_value(p1.asset_token_b, p1.asset_token_a, b_val);
+                    if total_debt * p1.min_collateral_ratio > total_collateral {
                         return Vec::new(); // 取出后质押率不足
                     }
                 }
 
-                let receipt_needed = if rate.is_zero() {
-                    round(actual_withdraw)
-                } else {
-                    round(actual_withdraw / rate)
-                };
-                let receipt_to_burn = receipt_needed.min(caller_receipt_bal);
-
-                msgs.push(Msg::Issue {
-                    token: collateral_receipt_token,
-                    account_id: caller_id,
-                    volume: -receipt_to_burn,
-                });
-                msgs.push(Msg::Transfer {
-                    src_id: contract.id,
-                    dst_id: caller_id,
-                    token: collateral_token,
-                    volume: actual_withdraw,
-                });
+                let needed = if rate.is_zero() { round(actual) } else { round(actual / rate) };
+                let to_burn = needed.min(caller_receipt);
+                res.push(Msg::Issue { token: receipt_b, account_id: caller_id, volume: -to_burn });
+                res.push(Msg::Transfer { src_id: contract.id, dst_id: caller_id, token, volume: actual });
             }
-
-            msgs
+            res
         });
 
-        (on_create, on_update, on_end, vec![exchange_asset, exchange_collateral])
+        // ── on_called[2]：dUSDT ↔ USDT 借款/还款（交叉质押） ──
+        let p2 = self.clone();
+        let borrow_repay_a: CalledFn = Arc::new(move |contract: &mut Contract, reader: &dyn EngineReader, caller_id: usize, volume: Decimal| -> Vec<Msg> {
+            if volume.is_zero() { return Vec::new(); }
+            let debt_a = match cached_receipt_id(contract, reader, &p2.debt_a_name, KEY_DEBT_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let receipt_a = match cached_receipt_id(contract, reader, &p2.receipt_a_name, KEY_ASSET_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let receipt_b = match cached_receipt_id(contract, reader, &p2.receipt_b_name, KEY_COLLATERAL_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let debt_b = match cached_receipt_id(contract, reader, &p2.debt_b_name, KEY_DEBT_RECEIPT_ID_B) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let mut res = Vec::new();
+            let token = p2.asset_token_a;
+            let token_b = p2.asset_token_b;
+
+            // 交叉质押检查：总价值 = aUSDT 池份额 + aBTC 池份额（以 USDT 计价）
+            let check_collateral = |reader: &dyn EngineReader, caller_id: usize, existing_debt_a: Decimal, additional_debt_a: Decimal,
+                receipt_a: usize, receipt_b: usize, debt_b: usize, token_a: usize, token_b: usize, min_ratio: Decimal| -> bool {
+                let d_b_bal = reader.node_balance(caller_id, debt_b);
+                let d_b_amt = if d_b_bal < Decimal::ZERO { -d_b_bal } else { Decimal::ZERO };
+                let total_debt = (existing_debt_a + additional_debt_a) + reader.convert_value(token_b, token_a, d_b_amt);
+                if total_debt <= Decimal::ZERO { return true; }
+
+                let r_a_bal = reader.node_balance(caller_id, receipt_a);
+                let r_b_bal = reader.node_balance(caller_id, receipt_b);
+                let pool_a_cash = contract.balance(token_a);
+                let pool_b_cash = contract.balance(token_b);
+                let d_a_sup = reader.token_total_supply(debt_a);
+                let d_b_sup = reader.token_total_supply(debt_b);
+                let borrowed_a = if d_a_sup < Decimal::ZERO { -d_a_sup } else { Decimal::ZERO };
+                let borrowed_b = if d_b_sup < Decimal::ZERO { -d_b_sup } else { Decimal::ZERO };
+                let r_a_sup = reader.token_total_supply(receipt_a);
+                let r_b_sup = reader.token_total_supply(receipt_b);
+                let a_val = if r_a_sup.is_zero() { Decimal::ZERO }
+                    else { (pool_a_cash + borrowed_a) * r_a_bal / r_a_sup };
+                let b_val = if r_b_sup.is_zero() { Decimal::ZERO }
+                    else { (pool_b_cash + borrowed_b) * r_b_bal / r_b_sup };
+                let total_collateral = a_val + reader.convert_value(token_b, token_a, b_val);
+                total_collateral > Decimal::ZERO && total_debt * min_ratio <= total_collateral
+            };
+
+            if volume > Decimal::ZERO {
+                // 还款
+                let repay = volume;
+                let caller_bal = reader.node_balance(caller_id, token);
+                if caller_bal < repay { return Vec::new(); }
+                let d_a_bal = reader.node_balance(caller_id, debt_a);
+                let max_repay = if d_a_bal < Decimal::ZERO { -d_a_bal } else { Decimal::ZERO };
+                let actual = repay.min(max_repay);
+                if actual <= Decimal::ZERO { return Vec::new(); }
+                res.push(Msg::Transfer { src_id: caller_id, dst_id: contract.id, token, volume: actual });
+                res.push(Msg::Issue { token: debt_a, account_id: caller_id, volume: actual });
+            } else {
+                // 借款
+                let mut borrow = -volume;
+                let pool_bal = contract.balance(token);
+                borrow = borrow.min(pool_bal);
+                if borrow <= Decimal::ZERO { return Vec::new(); }
+                let d_a_bal = reader.node_balance(caller_id, debt_a);
+                let existing = if d_a_bal < Decimal::ZERO { -d_a_bal } else { Decimal::ZERO };
+                if !check_collateral(reader, caller_id, existing, borrow, receipt_a, receipt_b, debt_b, token, token_b, p2.min_collateral_ratio) {
+                    return Vec::new();
+                }
+                res.push(Msg::Transfer { src_id: contract.id, dst_id: caller_id, token, volume: borrow });
+                res.push(Msg::Issue { token: debt_a, account_id: caller_id, volume: -borrow });
+            }
+            res
+        });
+
+        // ── on_called[3]：dBTC ↔ BTC 借款/还款（交叉质押） ──
+        let p3 = self.clone();
+        let borrow_repay_b: CalledFn = Arc::new(move |contract: &mut Contract, reader: &dyn EngineReader, caller_id: usize, volume: Decimal| -> Vec<Msg> {
+            if volume.is_zero() { return Vec::new(); }
+            let debt_b = match cached_receipt_id(contract, reader, &p3.debt_b_name, KEY_DEBT_RECEIPT_ID_B) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let receipt_a = match cached_receipt_id(contract, reader, &p3.receipt_a_name, KEY_ASSET_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let receipt_b = match cached_receipt_id(contract, reader, &p3.receipt_b_name, KEY_COLLATERAL_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let debt_a = match cached_receipt_id(contract, reader, &p3.debt_a_name, KEY_DEBT_RECEIPT_ID) {
+                Some(id) => id, None => return Vec::new(),
+            };
+            let mut res = Vec::new();
+            let token = p3.asset_token_b;
+            let token_a = p3.asset_token_a;
+
+            let check_collateral = |reader: &dyn EngineReader, caller_id: usize, existing_debt_b: Decimal, additional_debt_b: Decimal,
+                receipt_a: usize, receipt_b: usize, debt_a: usize, token_a: usize, token_b: usize, min_ratio: Decimal| -> bool {
+                let d_a_bal = reader.node_balance(caller_id, debt_a);
+                let d_a_amt = if d_a_bal < Decimal::ZERO { -d_a_bal } else { Decimal::ZERO };
+                let additional_in_a = reader.convert_value(token_b, token_a, additional_debt_b);
+                let existing_in_a = reader.convert_value(token_b, token_a, existing_debt_b);
+                let total_debt = d_a_amt + existing_in_a + additional_in_a;
+                if total_debt <= Decimal::ZERO { return true; }
+
+                let r_a_bal = reader.node_balance(caller_id, receipt_a);
+                let r_b_bal = reader.node_balance(caller_id, receipt_b);
+                let pool_a_cash = contract.balance(token_a);
+                let pool_b_cash = contract.balance(token_b);
+                let d_a_sup = reader.token_total_supply(debt_a);
+                let d_b_sup = reader.token_total_supply(debt_b);
+                let borrowed_a = if d_a_sup < Decimal::ZERO { -d_a_sup } else { Decimal::ZERO };
+                let borrowed_b = if d_b_sup < Decimal::ZERO { -d_b_sup } else { Decimal::ZERO };
+                let r_a_sup = reader.token_total_supply(receipt_a);
+                let r_b_sup = reader.token_total_supply(receipt_b);
+                let a_val = if r_a_sup.is_zero() { Decimal::ZERO }
+                    else { (pool_a_cash + borrowed_a) * r_a_bal / r_a_sup };
+                let b_val = if r_b_sup.is_zero() { Decimal::ZERO }
+                    else { (pool_b_cash + borrowed_b) * r_b_bal / r_b_sup };
+                let total_collateral = a_val + reader.convert_value(token_b, token_a, b_val);
+                total_collateral > Decimal::ZERO && total_debt * min_ratio <= total_collateral
+            };
+
+            if volume > Decimal::ZERO {
+                // 还 BTC
+                let repay = volume;
+                let caller_bal = reader.node_balance(caller_id, token);
+                if caller_bal < repay { return Vec::new(); }
+                let d_b_bal = reader.node_balance(caller_id, debt_b);
+                let max_repay = if d_b_bal < Decimal::ZERO { -d_b_bal } else { Decimal::ZERO };
+                let actual = repay.min(max_repay);
+                if actual <= Decimal::ZERO { return Vec::new(); }
+                res.push(Msg::Transfer { src_id: caller_id, dst_id: contract.id, token, volume: actual });
+                res.push(Msg::Issue { token: debt_b, account_id: caller_id, volume: actual });
+            } else {
+                // 借 BTC
+                let mut borrow = -volume;
+                let pool_bal = contract.balance(token);
+                borrow = borrow.min(pool_bal);
+                if borrow <= Decimal::ZERO { return Vec::new(); }
+                let d_b_bal = reader.node_balance(caller_id, debt_b);
+                let existing = if d_b_bal < Decimal::ZERO { -d_b_bal } else { Decimal::ZERO };
+                if !check_collateral(reader, caller_id, existing, borrow, receipt_a, receipt_b, debt_a, token_a, token, p3.min_collateral_ratio) {
+                    return Vec::new();
+                }
+                res.push(Msg::Transfer { src_id: contract.id, dst_id: caller_id, token, volume: borrow });
+                res.push(Msg::Issue { token: debt_b, account_id: caller_id, volume: -borrow });
+            }
+            res
+        });
+
+        (
+            on_create,
+            on_update,
+            on_end,
+            vec![exchange_a, exchange_b, borrow_repay_a, borrow_repay_b],
+        )
+    }
+
+    /// 按利用率计算利率（Compound 风格分段线性）
+    fn _calc_rate(&self, utilization: Decimal) -> Decimal {
+        if utilization < self.optimal_utilization {
+            let slope = if self.optimal_utilization.is_zero() {
+                Decimal::ZERO
+            } else {
+                self.slope1 * utilization / self.optimal_utilization
+            };
+            self.base_rate + slope
+        } else {
+            let one_minus = Decimal::ONE - self.optimal_utilization;
+            let slope = if one_minus.is_zero() {
+                Decimal::ZERO
+            } else {
+                self.slope2 * (utilization - self.optimal_utilization) / one_minus
+            };
+            self.base_rate + self.slope1 + slope
+        }
     }
 }

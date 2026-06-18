@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use rust_decimal::Decimal;
-use crate::node::{Node, Msg, TokenNode};
+use crate::node::{Node, Msg, TokenNode, SwapCheckFn, EngineReader};
 
 #[derive(Clone)]
 pub struct Token {
@@ -10,8 +10,8 @@ pub struct Token {
     sheet: HashMap<usize, Decimal>,
     total_supply: Decimal,
     can_be_negative: bool,
-    not_tradable: bool,
-    swap_whitelist: HashSet<usize>,
+    /// 交换检查闭包：None = 无限制（默认允许自由交易）
+    can_swap_with: Option<SwapCheckFn>,
 }
 
 impl Token {
@@ -23,8 +23,7 @@ impl Token {
             sheet: HashMap::new(),
             total_supply: Decimal::ZERO,
             can_be_negative: false,
-            not_tradable: false,
-            swap_whitelist: HashSet::new(),
+            can_swap_with: None,
         }
     }
     pub fn name(&self) -> &str {
@@ -66,16 +65,13 @@ impl TokenNode for Token {
     fn set_can_be_negative(&mut self, can: bool) {
         self.can_be_negative = can;
     }
-    fn not_tradable(&self) -> bool {
-        self.not_tradable
+    fn can_swap_with(&self, reader: &dyn EngineReader, self_token: usize, other_token: usize, src_node: usize, dst_node: usize) -> bool {
+        match &self.can_swap_with {
+            Some(f) => f(reader, self_token, other_token, src_node, dst_node),
+            None => true, // 默认无限制
+        }
     }
-    fn set_not_tradable(&mut self, v: bool) {
-        self.not_tradable = v;
-    }
-    fn swap_whitelist(&self) -> &HashSet<usize> {
-        &self.swap_whitelist
-    }
-    fn set_swap_whitelist(&mut self, whitelist: HashSet<usize>) {
-        self.swap_whitelist = whitelist;
+    fn set_swap_check_fn(&mut self, f: Option<SwapCheckFn>) {
+        self.can_swap_with = f;
     }
 }

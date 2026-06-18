@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::node::{Node, Msg, Drt, OrderBookDepth, PairNode, OrderNode, AccountNode, ContractNode, ContractState, ContractFn, CalledFn, EngineReader};
 use crate::token::Token;
 use crate::pair::Pair;
+use crate::virtual_pair::VirtualPair;
 use crate::account::Account;
 use crate::contract::Contract;
 use std::mem::take;
@@ -28,8 +29,10 @@ pub struct Rpte {
     registered_contracts: HashSet<usize>,
     /// 从实例 node_id → 主实例索引
     slave_to_master: HashMap<usize, usize>,
-    /// 代币虚拟锚定映射：token → anchor_token（1:1 价值绑定，用于查价）
-    token_virtual_anchors: HashMap<usize, usize>,
+    /// 虚拟交易对 ID 集合
+    registered_virtual_pairs: HashSet<usize>,
+    /// 虚拟交易对 node_id → (contract_slave_id, fn_id)
+    vp_contract_info: HashMap<usize, (usize, u8)>,
     registered_accounts: HashSet<usize>,
     registered_pairs: HashSet<usize>,
     registered_token_pairs: HashMap<(usize, usize), usize>,
@@ -70,12 +73,6 @@ impl EngineReader for Rpte {
     }
 
     fn get_current_price(&self, quote_token: usize, base_token: usize) -> Option<Decimal> {
-        // 虚拟锚定检查：若一方是另一方的锚定代币，返回 1.0
-        if self.token_virtual_anchors.get(&quote_token) == Some(&base_token)
-            || self.token_virtual_anchors.get(&base_token) == Some(&quote_token)
-        {
-            return Some(Decimal::ONE);
-        }
         // 查找已有交易对
         for &pid in &self.registered_pairs {
             if let Some(pair) = self.nodes[pid].as_pair_node_ref() {
@@ -85,9 +82,27 @@ impl EngineReader for Rpte {
                 }
             }
         }
+        // 查找虚拟交易对
+        for &vpid in &self.registered_virtual_pairs {
+            if let Some(pair) = self.nodes[vpid].as_pair_node_ref() {
+                if pair.get_quote_token() == quote_token && pair.get_base_token() == base_token {
+                    let price = pair.get_current_price();
+                    return if price.is_zero() { None } else { Some(price) };
+                }
+            }
+        }
         // 反向查找
         for &pid in &self.registered_pairs {
             if let Some(pair) = self.nodes[pid].as_pair_node_ref() {
+                if pair.get_quote_token() == base_token && pair.get_base_token() == quote_token {
+                    let price = pair.get_current_price();
+                    return if price.is_zero() { None } else { Some(Decimal::ONE / price) };
+                }
+            }
+        }
+        // 反向查虚拟交易对
+        for &vpid in &self.registered_virtual_pairs {
+            if let Some(pair) = self.nodes[vpid].as_pair_node_ref() {
                 if pair.get_quote_token() == base_token && pair.get_base_token() == quote_token {
                     let price = pair.get_current_price();
                     return if price.is_zero() { None } else { Some(Decimal::ONE / price) };
@@ -106,13 +121,6 @@ impl EngineReader for Rpte {
                 return Some((Decimal::ONE / price, dst, src));
             }
         }
-        // 通过 virtual_anchor 链换算凭证代币
-        if let Some(&anchor) = self.token_virtual_anchors.get(&src) {
-            return self.price_between(anchor, dst);
-        }
-        if let Some(&anchor) = self.token_virtual_anchors.get(&dst) {
-            return self.price_between(src, anchor);
-        }
         None
     }
 
@@ -126,12 +134,41 @@ impl EngineReader for Rpte {
             }
         }
         let quote = self.global_quote_token;
+
+        // 两端都不是 quote → 经典两步路径
         if src != quote && dst != quote {
             let mid = self.convert_value(src, quote, amount);
             if !mid.is_zero() {
                 return self.convert_value(quote, dst, mid);
             }
+            return Decimal::ZERO;
         }
+
+        // 一端是 quote 但直接转换失败 → 搜索含非 quote 端的交易对做路由
+        let other = if src == quote { dst } else { src };
+        // 收集所有交易对（普通 + 虚拟）中涉及 other 的配对代币
+        for pair_node in self.nodes.iter().filter_map(|n| n.as_pair_node_ref()) {
+            let qt = pair_node.get_quote_token();
+            let bt = pair_node.get_base_token();
+            let mid = if qt == other { bt } else if bt == other { qt } else { continue };
+            if mid == quote || mid == other {
+                continue;
+            }
+            // other → mid
+            if let Some((p, q, _)) = self.price_between(other, mid) {
+                if !p.is_zero() {
+                    let mid_amt = if other == q { amount / p } else { amount * p };
+                    if !mid_amt.is_zero() {
+                        // mid → quote (dst)
+                        let result = self.convert_value(mid, quote, mid_amt);
+                        if !result.is_zero() {
+                            return if src == quote { result } else { result };
+                        }
+                    }
+                }
+            }
+        }
+
         Decimal::ZERO
     }
 
@@ -223,7 +260,8 @@ impl Rpte {
             contract_pool: Vec::new(),
             registered_contracts: HashSet::new(),
             slave_to_master: HashMap::new(),
-            token_virtual_anchors: HashMap::new(),
+            registered_virtual_pairs: HashSet::new(),
+            vp_contract_info: HashMap::new(),
             registered_accounts: HashSet::new(),
             registered_pairs: HashSet::new(),
             registered_token_pairs: HashMap::new(),
@@ -331,18 +369,12 @@ impl Rpte {
             .unwrap_or(false)
     }
 
-    /// 检查两个代币是否允许组成交易对（白名单限制）
+    /// 检查两个代币是否允许组成交易对（通过 Token 闭包）
     pub fn is_swap_allowed(&self, a: usize, b: usize) -> bool {
         if a == b { return false; }
         let check = |token: usize, other: usize| -> bool {
             match self.nodes.get(token).and_then(|n| n.as_token_node_ref()) {
-                Some(t) => {
-                    if t.not_tradable() {
-                        return false;
-                    }
-                    let wl = t.swap_whitelist();
-                    wl.is_empty() || wl.contains(&other)
-                }
+                Some(t) => t.can_swap_with(self as &dyn EngineReader, token, other, 0, 0),
                 None => true,
             }
         };
@@ -382,8 +414,10 @@ impl Rpte {
     }
 
     /// 获取所有交易对的详细信息: (pair_id, quote_token, base_token, current_price)
+    /// 包含普通交易对和虚拟交易对。
     pub fn get_all_pairs_info(&mut self) -> Vec<(usize, usize, usize, Decimal)> {
-        let ids: Vec<usize> = self.registered_pairs.iter().cloned().collect();
+        let mut ids: Vec<usize> = self.registered_pairs.iter().cloned().collect();
+        ids.extend(self.registered_virtual_pairs.iter().cloned());
         let mut result = Vec::new();
         for id in ids {
             if let Some(pair) = self.nodes.get_mut(id).and_then(|n| n.as_pair_node()) {
@@ -682,41 +716,26 @@ impl Rpte {
             return result;
         }
 
-        // 通过 virtual_anchor 链换算凭证代币
-        if let Some(&anchor) = self.token_virtual_anchors.get(&src_token) {
-            if let Some(result) = try_pair(&pairs, anchor, dst_token, amount) {
-                return result;
-            }
-            // anchor 可能也不是直接可交易，递归走 quote 路径
-            if anchor != quote && dst_token != quote {
-                if let Some(mid) = try_pair(&pairs, anchor, quote, amount) {
-                    if !mid.is_zero() {
-                        if let Some(result) = try_pair(&pairs, quote, dst_token, mid) {
-                            return result;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(&anchor) = self.token_virtual_anchors.get(&dst_token) {
-            if let Some(result) = try_pair(&pairs, src_token, anchor, amount) {
-                return result;
-            }
-            if src_token != quote && anchor != quote {
-                if let Some(mid) = try_pair(&pairs, src_token, quote, amount) {
-                    if !mid.is_zero() {
-                        if let Some(result) = try_pair(&pairs, quote, anchor, mid) {
-                            return result;
-                        }
-                    }
-                }
-            }
-        }
-
         if src_token != quote && dst_token != quote {
             if let Some(mid) = try_pair(&pairs, src_token, quote, amount) {
                 if !mid.is_zero() {
                     if let Some(result) = try_pair(&pairs, quote, dst_token, mid) {
+                        return result;
+                    }
+                }
+            }
+            return Decimal::ZERO;
+        }
+
+        // 一端是 quote → 遍历所有交易对，找包含非 quote 端的对做路由
+        let other = if src_token == quote { dst_token } else { src_token };
+        for &(_, q, b, price) in &pairs {
+            if price.is_zero() { continue; }
+            let mid = if q == other { b } else if b == other { q } else { continue };
+            if mid == quote || mid == other { continue; }
+            if let Some(mid_amt) = try_pair(&pairs, other, mid, amount) {
+                if !mid_amt.is_zero() {
+                    if let Some(result) = try_pair(&pairs, mid, quote, mid_amt) {
                         return result;
                     }
                 }
@@ -978,6 +997,32 @@ impl Rpte {
 
     pub fn send_msg(&mut self, msg: Msg) { self.msgs.push(msg); }
 
+    /// 帧前：从主合约拉取报价写入 VirtualPair
+    fn _sync_vp_prices(&mut self) {
+        let vp_ids: Vec<usize> = self.registered_virtual_pairs.iter().copied().collect();
+        for vp_id in vp_ids {
+            let (slave_id, fn_id) = match self.vp_contract_info.get(&vp_id) {
+                Some(info) => *info,
+                None => continue,
+            };
+            let master_idx = match self.slave_to_master.get(&slave_id) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            if master_idx >= self.contract_masters.len() {
+                continue;
+            }
+            // 从 master 读取价格：PRICE_BASE + fn_id
+            let price_key = usize::MAX / 4 + fn_id as usize;
+            let price = self.contract_masters[master_idx].balance(price_key);
+            if !price.is_zero() {
+                if let Some(vp) = self.nodes[vp_id].as_pair_node() {
+                    vp.set_current_price(price);
+                }
+            }
+        }
+    }
+
     pub fn get_tra_logs(&mut self, src_token: usize, dst_token: usize) -> Result<VecDeque<TraLog>> {
         let (pair_id, _) = self.get_or_create_pair(src_token, dst_token)?;
         Ok(self.get_pair_node(pair_id)?.get_tra_logs().clone())
@@ -1035,7 +1080,20 @@ impl Rpte {
         // === 0b. 主 → 从同步（将主实例的余额复制到从实例） ===
         self._sync_master_to_slave();
 
-        // === 0c. 从实例也参与 upload_msgs ===
+        // === 0c. 虚拟交易对：从主合约拉取报价 ===
+        self._sync_vp_prices();
+
+        // === 0d. 虚拟交易对：执行内部撮合（match_virtual_orders） ===
+        {
+            let vp_ids: Vec<usize> = self.registered_virtual_pairs.iter().copied().collect();
+            for vp_id in vp_ids {
+                if let Some(vp) = self.nodes.get_mut(vp_id).and_then(|n| n.as_pair_node()) {
+                    vp.update(self.step_count);
+                }
+            }
+        }
+
+        // === 0e. 从实例也参与 upload_msgs ===
         for node in &mut self.nodes {
             all_msgs.extend(node.upload_msgs(self.step_count));
         }
@@ -1075,6 +1133,10 @@ impl Rpte {
                 }
             }
 
+            // 转账后同步 slave→master→slave，确保合约余额在收敛循环中保持最新
+            self._sync_slave_to_master();
+            self._sync_master_to_slave();
+
             // === 2. 处理所有关单 ===
             let mut remaining: Vec<Msg> = Vec::new();
             for msg in deferred {
@@ -1088,10 +1150,14 @@ impl Rpte {
                 }
             }
 
-            // === 3. 处理所有开单/市价单/创建合约 ===
+            // === 3. 处理所有开单/市价单/创建合约（CallContract 除外） ===
             let mut swap_groups: HashMap<(usize, Drt), Vec<(usize, Decimal)>> = HashMap::new();
+            let mut call_contract_msgs: Vec<Msg> = Vec::new();
             for msg in remaining {
                 match msg {
+                    Msg::CallContract { .. } => {
+                        call_contract_msgs.push(msg);
+                    }
                     Msg::OpenOrder { src_id, owner_node_id, src_token, dst_token, volume, price } => {
                         let can_neg = self.get_token_can_be_negative(src_token);
                         if volume.is_zero() || price.is_zero() || (!can_neg && volume > self.get_node_balance(src_id, src_token).unwrap_or(Decimal::ZERO)) {
@@ -1177,45 +1243,31 @@ impl Rpte {
                         let step = self.step_count;
                         self.create_master_slave(owner_node_id, &name, on_create, on_update, on_end, on_called, step);
                     }
-                    Msg::RegisterToken { name, can_be_negative, not_tradable, virtual_anchor, swap_whitelist } => {
+                    Msg::RegisterToken { name, can_be_negative, } => {
                         let id = self.register_token(&name);
                         if can_be_negative {
                             let _ = self.set_token_can_be_negative(id, true);
                         }
-                        if not_tradable {
-                            if let Some(tn) = self.nodes.get_mut(id).and_then(|n| n.as_token_node()) {
-                                tn.set_not_tradable(true);
+                    }
+                    Msg::CreateVirtualPair { contract_slave_id, fn_id, quote_token, base_token_name, swap_only } => {
+                        let base_token = match self.token_name_to_id.get(&base_token_name) {
+                            Some(&id) => id,
+                            None => {
+                                eprintln!("WARNING: CreateVirtualPair: base token '{}' not found", base_token_name);
+                                continue;
                             }
-                        }
-                        if let Some(anchor) = virtual_anchor {
-                            self.token_virtual_anchors.insert(id, anchor);
-                        }
-                        if !swap_whitelist.is_empty() {
-                            let wl: HashSet<usize> = swap_whitelist.into_iter().collect();
-                            if let Some(tn) = self.nodes.get_mut(id).and_then(|n| n.as_token_node()) {
-                                tn.set_swap_whitelist(wl);
-                            }
-                        }
+                        };
+                        let vp = VirtualPair::new(
+                            contract_slave_id, fn_id, quote_token, base_token,
+                            self.max_tra_log_length, self.precision, swap_only,
+                        );
+                        let vp_id = self.register_node(vp);
+                        self.registered_virtual_pairs.insert(vp_id);
+                        self.vp_contract_info.insert(vp_id, (contract_slave_id, fn_id));
+                        self.registered_token_pairs.insert((quote_token, base_token), vp_id);
                     }
                     Msg::Transfer { .. } | Msg::TransferAll { .. } | Msg::CloseOrder { .. } => {
                         // 不应到达此处
-                    }
-                    Msg::CallContract { src_id, contract_id, fn_id, volume } => {
-                        // 查找合约从实例，如果存在 on_called 则执行
-                        let is_contract = self.registered_contracts.contains(&contract_id);
-                        if !is_contract {
-                            continue;
-                        }
-                        // 查找主实例索引
-                        let master_idx = match self.slave_to_master.get(&contract_id) {
-                            Some(&idx) => idx,
-                            None => continue,
-                        };
-                        // 临时取出 master 以解除对 self 的借用冲突
-                        let mut master = self.contract_masters.remove(master_idx);
-                        let msgs = master.call(self, src_id, fn_id, volume);
-                        self.contract_masters.insert(master_idx, master);
-                        self.msgs.extend(msgs);
                     }
                     Msg::Issue { token, account_id, volume } => {
                         let _ = self.issue(account_id, token, volume);
@@ -1223,7 +1275,27 @@ impl Rpte {
                 }
             }
 
-            // === 3b. 批量处理按比例分配的市价单 ===
+            // === 3b. 逐一处理 CallContract（每轮收敛循环只处理一个，其余放回下一轮） ===
+            if !call_contract_msgs.is_empty() {
+                let first = call_contract_msgs.remove(0);
+                if let Msg::CallContract { src_id, contract_id, fn_id, volume } = first {
+                    let is_contract = self.registered_contracts.contains(&contract_id);
+                    if is_contract {
+                        if let Some(&master_idx) = self.slave_to_master.get(&contract_id) {
+                            let mut master = self.contract_masters.remove(master_idx);
+                            let msgs = master.call(self, src_id, fn_id, volume);
+                            self.contract_masters.insert(master_idx, master);
+                            all_msgs.extend(msgs);
+                        }
+                    }
+                }
+                // 剩余未处理的放回 all_msgs，下一轮收敛继续
+                for msg in call_contract_msgs {
+                    all_msgs.push(msg);
+                }
+            }
+
+            // === 3c. 批量处理按比例分配的市价单 ===
             for ((pair_node_id, direction), swaps) in swap_groups {
                 if swaps.len() == 1 {
                     let (owner_id, volume) = swaps[0];

@@ -24,36 +24,98 @@ pub fn random_bot() -> (bool, Decimal, Decimal) {
 
 
 pub struct RandomBotManager {
-    tokens: Vec<usize>,
     bots: Vec<usize>,
     max_order_ratio: usize,
+    // token IDs
+    usdt_token: usize,
+    btc_token: usize,
+    ausdt_token: usize,
+    abtc_token: usize,
+    dusdt_token: usize,
+    dbtc_token: usize,
 }
 
 
 impl RandomBotManager {
     pub fn new() -> Self {
         Self {
-            tokens: Vec::new(),
             bots: Vec::new(),
             max_order_ratio: 10,
+            usdt_token: 0,
+            btc_token: 0,
+            ausdt_token: 0,
+            abtc_token: 0,
+            dusdt_token: 0,
+            dbtc_token: 0,
         }
+    }
+
+    pub fn set_lending_tokens(&mut self, usdt: usize, btc: usize, ausdt: usize, abtc: usize, dusdt: usize, dbtc: usize) {
+        self.usdt_token = usdt;
+        self.btc_token = btc;
+        self.ausdt_token = ausdt;
+        self.abtc_token = abtc;
+        self.dusdt_token = dusdt;
+        self.dbtc_token = dbtc;
     }
 
     pub fn add_bot(&mut self, bot: usize) {
         self.bots.push(bot);
     }
 
-    pub fn add_token(&mut self, token: usize) {
-        self.tokens.push(token);
+    /// 生成当前 bot 可用的交易路线，返回 (src, dst, swap_only)
+    /// 分离常规交易和合约交互，给合约路线低权重
+    fn get_available_routes(&self, rpte: &mut Rpte, bot: usize) -> Vec<(usize, usize, bool)> {
+        let zero = Decimal::ZERO;
+        let eps = Decimal::new(1, 6);
+        let usdt_bal = rpte.get_node_balance(bot, self.usdt_token).unwrap_or(zero);
+        let btc_bal  = rpte.get_node_balance(bot, self.btc_token).unwrap_or(zero);
+        let ausdt_bal = rpte.get_node_balance(bot, self.ausdt_token).unwrap_or(zero);
+        let abtc_bal = rpte.get_node_balance(bot, self.abtc_token).unwrap_or(zero);
+        let dusdt_bal = rpte.get_node_balance(bot, self.dusdt_token).unwrap_or(zero);
+        let dbtc_bal = rpte.get_node_balance(bot, self.dbtc_token).unwrap_or(zero);
+
+        let mut routes = Vec::new();
+
+        // ── 常规交易路线（高权重，~90%） ──
+        // 每个符合条件的路线重复 9 次，提高选中概率
+        if usdt_bal > eps {
+            for _ in 0..9 { routes.push((self.usdt_token, self.btc_token, false)); }
+            if dusdt_bal < -eps {
+                for _ in 0..1 { routes.push((self.usdt_token, self.dusdt_token, true)); } // 还款
+            }
+        }
+        if btc_bal > eps {
+            for _ in 0..9 { routes.push((self.btc_token, self.usdt_token, false)); }
+            if dbtc_bal < -eps {
+                for _ in 0..1 { routes.push((self.btc_token, self.dbtc_token, true)); } // 还 BTC
+            }
+        }
+
+        // ── 合约交互路线（低权重，~10%） ──
+        // 每个路线只出现一次
+        if usdt_bal > eps {
+            routes.push((self.usdt_token, self.ausdt_token, false)); // 存款
+        }
+        if btc_bal > eps {
+            routes.push((self.btc_token, self.abtc_token, true));    // 存质押
+        }
+        if ausdt_bal > eps {
+            routes.push((self.ausdt_token, self.usdt_token, false)); // 取款
+        }
+        if abtc_bal > eps {
+            routes.push((self.abtc_token, self.btc_token, true));    // 取质押
+            routes.push((self.dusdt_token, self.usdt_token, true));  // 借 USDT
+            routes.push((self.dbtc_token, self.btc_token, true));    // 借 BTC
+        }
+
+        routes
     }
 
     pub fn step(&mut self, rpte: &mut Rpte) {
-        if self.tokens.len() < 2 {
-            return;
-        }
         let mut rng = rand::thread_rng();
         for bot in &self.bots {
-            // 当订单数达到上限时，随机关闭当前 bot 的一个订单
+            // 取消超量订单
             let cancel_target = rpte.get_account_orders(*bot).ok().and_then(|order_set| {
                 let ids: Vec<usize> = order_set.iter().copied().collect();
                 if ids.len() >= self.max_order_ratio {
@@ -70,29 +132,53 @@ impl RandomBotManager {
                 continue;
             }
 
-            let src_token = self.tokens[rng.gen_range(0..self.tokens.len())];
-            let dst_token = loop {
-                let dst = self.tokens[rng.gen_range(0..self.tokens.len())];
-                if dst != src_token {
-                    break dst;
-                }
-            };
-            let (is_swap, amount_ratio, price_ratio) = random_bot();
-            let (pair_price, quote, _base) = rpte.get_current_price(src_token, dst_token).unwrap();
-
-            let volume = amount_ratio * rpte.get_node_balance(*bot, src_token).unwrap();
-            if volume.is_zero() {
+            let routes = self.get_available_routes(rpte, *bot);
+            if routes.is_empty() {
                 continue;
             }
-            let price = if src_token == quote {
-                pair_price * (Decimal::ONE - price_ratio)
+            let (src_token, dst_token, swap_only) = &routes[rng.gen_range(0..routes.len())];
+            let src_token = *src_token;
+            let dst_token = *dst_token;
+            let swap_only = *swap_only;
+
+            let (is_swap, amount_ratio, price_ratio) = random_bot();
+
+            // 计算交易量
+            let volume = if src_token == self.dusdt_token && dst_token == self.usdt_token {
+                // 借 USDT：以 USDT 余额为参考
+                let ref_bal = rpte.get_node_balance(*bot, self.usdt_token).unwrap_or(Decimal::ZERO);
+                if ref_bal > Decimal::ZERO {
+                    amount_ratio * ref_bal
+                } else {
+                    amount_ratio * Decimal::new(1000, 0)
+                }
+            } else if src_token == self.dbtc_token && dst_token == self.btc_token {
+                // 借 BTC：以 BTC 余额为参考
+                let ref_bal = rpte.get_node_balance(*bot, self.btc_token).unwrap_or(Decimal::ZERO);
+                if ref_bal > Decimal::ZERO {
+                    amount_ratio * ref_bal
+                } else {
+                    amount_ratio * Decimal::new(1, 0) // 首次借 1 BTC
+                }
             } else {
-                pair_price * (Decimal::ONE + price_ratio)
+                let bal = rpte.get_node_balance(*bot, src_token).unwrap_or(Decimal::ZERO);
+                amount_ratio * bal
             };
 
-            if is_swap {
+            if volume <= Decimal::ZERO {
+                continue;
+            }
+
+            // swap_only 对强制市价单，其他随机市价/限价
+            if swap_only || is_swap {
                 rpte.swap(*bot, src_token, dst_token, volume);
             } else {
+                let (pair_price, quote, _base) = rpte.get_current_price(src_token, dst_token).unwrap();
+                let price = if src_token == quote {
+                    pair_price * (Decimal::ONE - price_ratio)
+                } else {
+                    pair_price * (Decimal::ONE + price_ratio)
+                };
                 rpte.make(*bot, src_token, dst_token, volume, price);
             }
         }
@@ -101,15 +187,13 @@ impl RandomBotManager {
 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut rpte = Rpte::new("USDT", 5);
+    let mut rpte = Rpte::new("USDT", 8);
     let mut bot_manager = RandomBotManager::new();
 
     let btc_token = rpte.register_token("BTC");
     let usdt_token = rpte.get_token_by_name("USDT").unwrap();
-    bot_manager.add_token(btc_token);
-    bot_manager.add_token(usdt_token);
 
-    for _i in 0..200 {
+    for _i in 0..400 {
         let account = rpte.register_account();
         let _ = rpte.issue(account, usdt_token, 100000000u64);
         let _ = rpte.issue(account, btc_token, 1000u64);
@@ -117,23 +201,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let player = rpte.register_account();
-    let _ = rpte.issue(player, usdt_token, 10000u64);
+    let _ = rpte.issue(player, usdt_token, 10u64);
 
-    // 用 player 部署 USDT 资产 - BTC 质押 借贷合约
-    let lending = LendingPreset::new(
-        usdt_token,      // 资产代币
-        btc_token,       // 质押代币
-        "aUSDT",         // 资产凭证代币名称
-        "aBTC",          // 质押凭证代币名称
-        Decimal::new(15, 1),  // min_collateral_ratio = 1.50
-        Decimal::new(13, 1),  // liquidation_threshold = 1.30
+    // 部署双向借贷合约（USDT + BTC 双池，交叉质押）
+    let lending = LendingPreset::new_bidirectional(
+        usdt_token,      // asset_token_a
+        btc_token,       // asset_token_b
+        "aUSDT",         // receipt_a_name
+        "aBTC",          // receipt_b_name
+        "dUSDT",         // debt_a_name
+        "dBTC",          // debt_b_name
+        Decimal::new(130, 2),  // min_collateral_ratio = 1.30
+        Decimal::new(110, 2),  // liquidation_threshold = 1.10
     );
     let (on_create, on_update, on_end, on_called_fns) = lending.build();
     rpte.deploy(player, "USDT/BTC Lending", on_create, on_update, on_end, on_called_fns);
-    // 跑一帧触发 on_create（注册凭证代币）
+    // 跑两帧：第一帧处理 CreateContract 消息，第二帧触发 on_create 注册凭证代币
+    rpte.step();
     rpte.step();
 
-    tui::run_tui(&mut rpte, 100, 60, 10, Some(player), |eng| {
+    // 将借贷凭证代币 ID 注册到机器人管理器
+    let ausdt_token = rpte.get_token_by_name("aUSDT").unwrap();
+    let abtc_token = rpte.get_token_by_name("aBTC").unwrap();
+    let dusdt_token = rpte.get_token_by_name("dUSDT").unwrap();
+    let dbtc_token = rpte.get_token_by_name("dBTC").unwrap();
+    bot_manager.set_lending_tokens(usdt_token, btc_token, ausdt_token, abtc_token, dusdt_token, dbtc_token);
+
+    tui::run_tui(&mut rpte, 20, 120, 10, Some(player), |eng| {
         bot_manager.step(eng);
     })?;
 

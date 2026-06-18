@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::sync::Arc;
 use rust_decimal::Decimal;
 use crate::order::{OrderBrief, OrderType};
 use crate::pair::{TraLog, CandleData};
 
+/// Token 交换检查闭包：(EngineReader, self_token, other_token, src_node, dst_node) → 是否允许
+pub type SwapCheckFn = Arc<dyn Fn(&dyn EngineReader, usize, usize, usize, usize) -> bool + Send + Sync>;
 
 pub trait Node { 
     fn update(&mut self, _step_count: u64) {}
@@ -69,14 +72,12 @@ pub trait TokenNode: Node {
     fn can_be_negative(&self) -> bool;
     /// 设置是否允许负持仓
     fn set_can_be_negative(&mut self, can: bool);
-    /// 查询是否不可在交易对中自由交换
-    fn not_tradable(&self) -> bool;
-    /// 设置不可自由交换
-    fn set_not_tradable(&mut self, v: bool);
-    /// 交换白名单：此代币只能与白名单内的其他代币组成交易对。空集合 = 允许自由组合。
-    fn swap_whitelist(&self) -> &HashSet<usize>;
-    /// 设置交换白名单
-    fn set_swap_whitelist(&mut self, whitelist: HashSet<usize>);
+    /// 检查此代币是否可与 another 交易（闭包逻辑）。
+    /// 闭包签名：(EngineReader, self_token, other_token, src_node, dst_node) → bool
+    /// None = 无限制（默认允许）
+    fn can_swap_with(&self, reader: &dyn EngineReader, self_token: usize, other_token: usize, src_node: usize, dst_node: usize) -> bool;
+    /// 设置交换检查闭包
+    fn set_swap_check_fn(&mut self, f: Option<SwapCheckFn>);
 }
 
 pub trait OrderNode: Node {
@@ -97,6 +98,8 @@ pub trait PairNode: Node {
     fn get_quote_token(&self) -> usize;
     fn get_base_token(&self) -> usize;
     fn get_current_price(&self) -> Decimal;
+    /// 设置当前价格（虚拟交易对用于缓存合约报价）
+    fn set_current_price(&mut self, _price: Decimal) {}
     fn get_order_book(&self, direction: Drt, depth: usize) -> OrderBookDepth;
     fn get_tra_logs(&self) -> VecDeque<TraLog>;
     fn get_candle_data(&self, interval: u64) -> VecDeque<CandleData>;
@@ -258,11 +261,17 @@ pub enum Msg {
     RegisterToken {
         name: String,
         can_be_negative: bool,
-        not_tradable: bool,
-        /// 虚拟锚定代币：此代币与非交易对的锚定代币 1:1 价值绑定（用于查价）
-        virtual_anchor: Option<usize>,
-        /// 交换白名单：仅允许与这些代币组成交易对。空 Vec = 自由组合。
-        swap_whitelist: Vec<usize>,
+    },
+    CreateVirtualPair {
+        /// 合约从实例 ID
+        contract_slave_id: usize,
+        /// 绑定的 CalledFn 索引
+        fn_id: u8,
+        quote_token: usize,
+        /// base token 名称（引擎按名称解析 ID，支持跨帧创建）
+        base_token_name: String,
+        /// 只许市价单模式（固定汇率对如 dUSDT/USDT 适用）
+        swap_only: bool,
     },
     /// 调用合约：src_id 向 contract_id 发起调用，携带 volume
     CallContract {
