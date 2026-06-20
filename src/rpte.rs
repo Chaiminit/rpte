@@ -639,7 +639,7 @@ impl Rpte {
         if hops.is_empty() {
             return Err(Error::NoRouteFound { src: src_token, dst: dst_token });
         }
-        self.msgs.push(Msg::FastSwap { src_id, hops, volume });
+        self.msgs.push(Msg::FastSwap { src_id, hops, volume, current_hop: 0 });
         Ok(())
     }
 
@@ -1422,8 +1422,9 @@ impl Rpte {
                     Msg::SetPairFee { pair_id, fee_fn } => {
                         let _ = self.set_pair_fee(pair_id, fee_fn);
                     }
-                    Msg::FastSwap { src_id, hops, volume } => {
-                        for hop in &hops {
+                    Msg::FastSwap { src_id, hops, volume, current_hop } => {
+                        if current_hop < hops.len() {
+                            let hop = &hops[current_hop];
                             self.msgs.push(Msg::SwapOrder {
                                 src_id,
                                 owner_node_id: src_id,
@@ -1432,6 +1433,13 @@ impl Rpte {
                                 volume,
                                 pair_id: Some(hop.pair_id),
                             });
+                            // 还有下一跳 → 下一帧继续
+                            if current_hop + 1 < hops.len() {
+                                self.msgs.push(Msg::FastSwap {
+                                    src_id, hops, volume,
+                                    current_hop: current_hop + 1,
+                                });
+                            }
                         }
                     }
                 }
