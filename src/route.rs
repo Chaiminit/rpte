@@ -25,16 +25,3 @@ impl Route {
         Self { src_token, dst_token, pair_id: Some(pair_id) }
     }
 }
-
-/// 路由跳：引擎 `route_discover` 返回的单步兑换路径。
-///
-/// 表示通过某个交易对将 `src_token` 兑换为 `dst_token`。
-#[derive(Clone, Copy, Debug)]
-pub struct RouteHop {
-    /// 交易对 ID
-    pub pair_id: usize,
-    /// 此跳的源代币（支出）
-    pub src_token: usize,
-    /// 此跳的目标代币（收入）
-    pub dst_token: usize,
-}

@@ -13,7 +13,6 @@ use std::mem::take;
 use crate::order::{Order, OrderBrief, OrderType};
 use crate::pair::{TraLog, CandleData};
 use crate::route::Route;
-use crate::route::RouteHop;
 
 
 pub struct Rpte {
@@ -631,18 +630,6 @@ impl Rpte {
         });
     }
 
-    /// 快速兑换：自动发现 src → dst 的最优路径并逐跳执行 swap。
-    /// 不保证原子性，每跳的 volume 由引擎的 balance check 自动适配。
-    pub fn fast_swap(&mut self, src_id: usize, src_token: usize, volume: impl Into<Decimal>, dst_token: usize) -> Result<()> {
-        let volume = self.round(volume.into());
-        let hops = self.route_discover(src_token, dst_token);
-        if hops.is_empty() {
-            return Err(Error::NoRouteFound { src: src_token, dst: dst_token });
-        }
-        self.msgs.push(Msg::FastSwap { src_id, hops, volume });
-        Ok(())
-    }
-
     /// 调用合约
     pub fn call_contract(&mut self, src_id: usize, contract_id: usize, fn_id: u8, volume: impl Into<Decimal>) {
         let volume = self.round(volume.into());
@@ -749,66 +736,6 @@ impl Rpte {
     /// 截断到引擎精度
     pub fn round(&self, value: Decimal) -> Decimal {
         value.round_dp_with_strategy(self.precision as u32, RoundingStrategy::ToZero)
-    }
-
-    /// 发现 src_token → dst_token 的兑换路径，返回每跳使用的交易对。
-    ///
-    /// 搜索策略与 `convert_value` 一致：
-    /// 1. 直接交易对（src ↔ dst）
-    /// 2. 通过全局 quote 代币中转（src → quote → dst）
-    /// 3. 通过任意第三方代币中转（src → mid → dst）
-    ///
-    /// 返回空 Vec 表示无可用路径。
-    pub fn route_discover(&mut self, src: usize, dst: usize) -> Vec<RouteHop> {
-        if src == dst {
-            return Vec::new();
-        }
-
-        let pairs = self.get_all_pairs_info();
-        let quote = self.global_quote_token;
-
-        // 辅助：在 pairs 中找 src→dst 的直连交易对
-        let find_direct = |pairs: &[(usize, usize, usize, Decimal)], s: usize, d: usize| -> Option<RouteHop> {
-            for &(pid, q, b, price) in pairs {
-                if price.is_zero() {
-                    continue;
-                }
-                if q == s && b == d {
-                    return Some(RouteHop { pair_id: pid, src_token: s, dst_token: d });
-                }
-                if q == d && b == s {
-                    return Some(RouteHop { pair_id: pid, src_token: s, dst_token: d });
-                }
-            }
-            None
-        };
-
-        // 1. 直接交易对
-        if let Some(hop) = find_direct(&pairs, src, dst) {
-            return vec![hop];
-        }
-
-        // 2. 通过全局 quote 代币
-        if let (Some(h1), Some(h2)) = (find_direct(&pairs, src, quote), find_direct(&pairs, quote, dst)) {
-            return vec![h1, h2];
-        }
-
-        // 3. 通过任意第三方（≠ quote）
-        let other = if src == quote { dst } else { src };
-        for &(_pid, q, b, price) in &pairs {
-            if price.is_zero() {
-                continue;
-            }
-            let mid = if q == other { b } else if b == other { q } else { continue };
-            if mid == quote || mid == other {
-                continue;
-            }
-            if let (Some(h1), Some(h2)) = (find_direct(&pairs, src, mid), find_direct(&pairs, mid, dst)) {
-                return vec![h1, h2];
-            }
-        }
-
-        Vec::new()
     }
 
     /// 通过交易对路径将 src_token 的数量换算为 dst_token 的数量。
@@ -1421,18 +1348,6 @@ impl Rpte {
                     }
                     Msg::SetPairFee { pair_id, fee_fn } => {
                         let _ = self.set_pair_fee(pair_id, fee_fn);
-                    }
-                    Msg::FastSwap { src_id, hops, volume } => {
-                        for hop in &hops {
-                            self.msgs.push(Msg::SwapOrder {
-                                src_id,
-                                owner_node_id: src_id,
-                                src_token: hop.src_token,
-                                dst_token: hop.dst_token,
-                                volume,
-                                pair_id: Some(hop.pair_id),
-                            });
-                        }
                     }
                 }
             }
