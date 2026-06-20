@@ -303,7 +303,5 @@ pub enum Msg {
         src_id: usize,
         hops: Vec<RouteHop>,
         volume: Decimal,
-        /// 当前处理到第几跳，从 0 开始
-        current_hop: usize,
     },
 }
