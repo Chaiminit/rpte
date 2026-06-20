@@ -100,13 +100,17 @@ impl RandomBotManager {
         if btc_bal > eps {
             routes.push((self.btc_token, self.abtc_token, true));    // 存质押
         }
+        // aUSDT 也可作为质押：取款、借 USDT、借 BTC
         if ausdt_bal > eps {
             routes.push((self.ausdt_token, self.usdt_token, false)); // 取款
+            routes.push((self.dusdt_token, self.usdt_token, true));  // 借 USDT（用 aUSDT 质押）
+            routes.push((self.dbtc_token, self.btc_token, true));    // 借 BTC（用 aUSDT 质押）
         }
+        // aBTC 作为质押：取质押、借 USDT、借 BTC
         if abtc_bal > eps {
             routes.push((self.abtc_token, self.btc_token, true));    // 取质押
-            routes.push((self.dusdt_token, self.usdt_token, true));  // 借 USDT
-            routes.push((self.dbtc_token, self.btc_token, true));    // 借 BTC
+            routes.push((self.dusdt_token, self.usdt_token, true));  // 借 USDT（用 aBTC 质押）
+            routes.push((self.dbtc_token, self.btc_token, true));    // 借 BTC（用 aBTC 质押）
         }
 
         routes
@@ -201,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let player = rpte.register_account();
-    let _ = rpte.issue(player, usdt_token, 10u64);
+    let _ = rpte.issue(player, btc_token, 1000000u64);
 
     // 部署双向借贷合约（USDT + BTC 双池，交叉质押）
     let lending = LendingPreset::new_bidirectional(

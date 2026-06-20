@@ -285,16 +285,11 @@ impl LendingPreset {
                 let health = total_collateral / total_debt;
                 if health >= p_up.liquidation_threshold { continue; }
 
-                // ── 触发清算：销毁全部存款凭证，差额的一半由对方池通过市场 swap 补足 ──
-                let btc_price = reader.convert_value(token_b, token_a, Decimal::ONE);
+                // ── 触发清算：单池独立模型 ──
+                // 各池独立清算，没收的质押品留在池中，负债清零后池子承担亏损
+                // 交叉质押的意义：允许用任一池质押品借任一池资产，但清算时各池盈亏自担
 
-                // 计算各池被没收的份额价值
-                let seized_a = if r_a_supply.is_zero() || r_a_bal.is_zero() { Decimal::ZERO }
-                    else { (pool_a_cash + borrowed_a) * r_a_bal / r_a_supply };
-                let seized_b_btc = if r_b_supply.is_zero() || r_b_bal.is_zero() { Decimal::ZERO }
-                    else { (pool_b_cash + borrowed_b) * r_b_bal / r_b_supply };
-
-                // 销毁所有存款凭证
+                // 销毁所有存款凭证（质押品留在池中，由存款人共享）
                 if r_a_bal > Decimal::ZERO {
                     msgs.push(Msg::Issue { token: receipt_a, account_id: acc, volume: -r_a_bal });
                 }
@@ -302,69 +297,7 @@ impl LendingPreset {
                     msgs.push(Msg::Issue { token: receipt_b, account_id: acc, volume: -r_b_bal });
                 }
 
-                // 计算各池净额（正 = 超额，负 = 短缺）
-                let half_net_a = round((seized_a - debt_a_amt) / Decimal::new(2, 0));   // USDT
-                let half_net_b_btc = round((seized_b_btc - debt_b_amt) / Decimal::new(2, 0)); // BTC
-
-                // 各池超额/短缺的一半通过市场 swap 与对方池共享
-                if btc_price > Decimal::ZERO {
-                    // A 池超额 → 卖 USDT 买 BTC，分给 B 池
-                    if half_net_a > Decimal::ZERO {
-                        let swap_usdt = half_net_a.min(pool_a_cash);
-                        if swap_usdt > Decimal::ZERO {
-                            msgs.push(Msg::SwapOrder {
-                                src_id: contract.id,
-                                owner_node_id: contract.id,
-                                src_token: token_a,
-                                dst_token: token_b,
-                                volume: swap_usdt,
-                            });
-                        }
-                    }
-                    // B 池超额 → 卖 BTC 买 USDT，分给 A 池
-                    if half_net_b_btc > Decimal::ZERO {
-                        let swap_btc = half_net_b_btc.min(pool_b_cash);
-                        if swap_btc > Decimal::ZERO {
-                            msgs.push(Msg::SwapOrder {
-                                src_id: contract.id,
-                                owner_node_id: contract.id,
-                                src_token: token_b,
-                                dst_token: token_a,
-                                volume: swap_btc,
-                            });
-                        }
-                    }
-                    // A 池短缺 → 从 B 池调（卖 BTC 买 USDT）
-                    if half_net_a < Decimal::ZERO {
-                        let need_usdt = -half_net_a;
-                        let swap_btc = round(need_usdt / btc_price).min(pool_b_cash);
-                        if swap_btc > Decimal::ZERO {
-                            msgs.push(Msg::SwapOrder {
-                                src_id: contract.id,
-                                owner_node_id: contract.id,
-                                src_token: token_b,
-                                dst_token: token_a,
-                                volume: swap_btc,
-                            });
-                        }
-                    }
-                    // B 池短缺 → 从 A 池调（卖 USDT 买 BTC）
-                    if half_net_b_btc < Decimal::ZERO {
-                        let need_btc = -half_net_b_btc;
-                        let swap_usdt = round(need_btc * btc_price).min(pool_a_cash);
-                        if swap_usdt > Decimal::ZERO {
-                            msgs.push(Msg::SwapOrder {
-                                src_id: contract.id,
-                                owner_node_id: contract.id,
-                                src_token: token_a,
-                                dst_token: token_b,
-                                volume: swap_usdt,
-                            });
-                        }
-                    }
-                }
-
-                // 清零所有负债
+                // 清零所有负债（池子承担亏损，如果有差额）
                 if d_a_bal < Decimal::ZERO {
                     msgs.push(Msg::Issue { token: debt_a, account_id: acc, volume: -d_a_bal });
                 }
@@ -449,6 +382,43 @@ impl LendingPreset {
                 let pool_bal = contract.balance(token);
                 actual = actual.min(pool_bal);
                 if actual <= Decimal::ZERO { return Vec::new(); }
+
+                // 取出后保证总质押率满足要求（交叉质押检查）
+                let debt_b = match cached_receipt_id(contract, reader, &p0.debt_b_name, KEY_DEBT_RECEIPT_ID_B) {
+                    Some(id) => id, None => return Vec::new(),
+                };
+                let receipt_b = match cached_receipt_id(contract, reader, &p0.receipt_b_name, KEY_COLLATERAL_RECEIPT_ID) {
+                    Some(id) => id, None => return Vec::new(),
+                };
+                let d_a_bal = reader.node_balance(caller_id, debt_a);
+                let d_b_bal = reader.node_balance(caller_id, debt_b);
+                let d_a_amt = if d_a_bal < Decimal::ZERO { -d_a_bal } else { Decimal::ZERO };
+                let d_b_amt = if d_b_bal < Decimal::ZERO { -d_b_bal } else { Decimal::ZERO };
+                let total_debt = d_a_amt + reader.convert_value(p0.asset_token_b, p0.asset_token_a, d_b_amt);
+                if total_debt > Decimal::ZERO {
+                    // 估算取后剩余的质押价值
+                    let needed = if rate.is_zero() { round(actual) } else { round(actual / rate) };
+                    let remaining_receipt_a = caller_receipt - needed;
+                    let r_b_bal = reader.node_balance(caller_id, receipt_b);
+                    let r_a_supply = reader.token_total_supply(receipt_a);
+                    let r_b_supply = reader.token_total_supply(receipt_b);
+                    let pool_a_cash = contract.balance(p0.asset_token_a);
+                    let pool_b_cash = contract.balance(p0.asset_token_b);
+                    let d_a_sup = reader.token_total_supply(debt_a);
+                    let d_b_sup = reader.token_total_supply(debt_b);
+                    let borrowed_a = if d_a_sup < Decimal::ZERO { -d_a_sup } else { Decimal::ZERO };
+                    let borrowed_b = if d_b_sup < Decimal::ZERO { -d_b_sup } else { Decimal::ZERO };
+
+                    let a_val = if r_a_supply.is_zero() { Decimal::ZERO }
+                        else { ((pool_a_cash + borrowed_a) - actual) * remaining_receipt_a / r_a_supply };
+                    let b_val = if r_b_supply.is_zero() { Decimal::ZERO }
+                        else { (pool_b_cash + borrowed_b) * r_b_bal / r_b_supply };
+                    let total_collateral = a_val + reader.convert_value(p0.asset_token_b, p0.asset_token_a, b_val);
+                    if total_debt * p0.min_collateral_ratio > total_collateral {
+                        return Vec::new(); // 取出后质押率不足
+                    }
+                }
+
                 let needed = if rate.is_zero() { round(actual) } else { round(actual / rate) };
                 let to_burn = needed.min(caller_receipt);
                 res.push(Msg::Issue { token: receipt_a, account_id: caller_id, volume: -to_burn });
