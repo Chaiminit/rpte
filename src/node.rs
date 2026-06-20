@@ -6,6 +6,7 @@ use rust_decimal::Decimal;
 use crate::order::{OrderBrief, OrderType};
 use crate::pair::{TraLog, CandleData};
 use crate::fee::FeeFn;
+use crate::route::RouteHop;
 
 /// Token 交换检查闭包：(EngineReader, self_token, other_token, src_node, dst_node) → 是否允许
 pub type SwapCheckFn = Arc<dyn Fn(&dyn EngineReader, usize, usize, usize, usize) -> bool + Send + Sync>;
@@ -296,5 +297,11 @@ pub enum Msg {
     SetPairFee {
         pair_id: usize,
         fee_fn: Option<FeeFn>,
+    },
+    /// 快速兑换：按发现的路由多跳自动兑换
+    FastSwap {
+        src_id: usize,
+        hops: Vec<RouteHop>,
+        volume: Decimal,
     },
 }

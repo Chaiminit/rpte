@@ -76,6 +76,7 @@ pub mod route;
 
 pub use rpte::Rpte;
 pub use route::Route;
+pub use route::RouteHop;
 pub use fee::FeeCtx;
 pub use fee_presets::empty_fee;
 pub use fee_presets::taker_maker_fee;
