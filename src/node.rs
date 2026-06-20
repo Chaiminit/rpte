@@ -5,6 +5,7 @@ use std::sync::Arc;
 use rust_decimal::Decimal;
 use crate::order::{OrderBrief, OrderType};
 use crate::pair::{TraLog, CandleData};
+use crate::fee::FeeFn;
 
 /// Token 交换检查闭包：(EngineReader, self_token, other_token, src_node, dst_node) → 是否允许
 pub type SwapCheckFn = Arc<dyn Fn(&dyn EngineReader, usize, usize, usize, usize) -> bool + Send + Sync>;
@@ -106,16 +107,19 @@ pub trait PairNode: Node {
     fn latest_candle(&self, interval: u64) -> Option<CandleData>;
     fn push_tra_log(&mut self, step_count: u64, src_id: usize, dst_id: usize, price: Decimal, volume: Decimal);
     fn update_brief(&mut self, brief: OrderBrief);
-    fn insert_brief(&mut self, brief: OrderBrief);
+    /// 插入订单并触发撮合
+    fn insert_brief(&mut self, brief: OrderBrief, reader: &dyn EngineReader);
     fn cancel_brief(&mut self, id: usize);
-    fn match_orders(&mut self);
-    /// 市价单直接撮合，不创建临时订单节点。
+    /// 限价单撮合
+    fn match_orders(&mut self, reader: &dyn EngineReader);
     /// 返回 (转账指令列表, 需关闭的订单ID列表)，引擎在同一帧执行。
-    fn process_swap(&mut self, owner_id: usize, direction: Drt, volume: Decimal) -> (Vec<SwapTransfer>, Vec<usize>);
+    fn process_swap(&mut self, owner_id: usize, direction: Drt, volume: Decimal, reader: &dyn EngineReader) -> (Vec<SwapTransfer>, Vec<usize>);
     /// 批量市价单按比例分配撮合。
     /// swaps 为 [(owner_id, volume_in_source_token), ...]，同方向多个 swap 共享流动性。
     /// 返回 (转账指令列表, 需关闭的订单ID列表)。
-    fn process_swaps_batch(&mut self, direction: Drt, swaps: &[(usize, Decimal)]) -> (Vec<SwapTransfer>, Vec<usize>);
+    fn process_swaps_batch(&mut self, direction: Drt, swaps: &[(usize, Decimal)], reader: &dyn EngineReader) -> (Vec<SwapTransfer>, Vec<usize>);
+    /// 设置手续费闭包
+    fn set_fee_fn(&mut self, _fee_fn: Option<FeeFn>) {}
 }
 
 
@@ -285,5 +289,10 @@ pub enum Msg {
         token: usize,
         account_id: usize,
         volume: Decimal,
+    },
+    /// 设置交易对的手续费
+    SetPairFee {
+        pair_id: usize,
+        fee_fn: Option<FeeFn>,
     },
 }

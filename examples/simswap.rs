@@ -205,7 +205,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let player = rpte.register_account();
-    let _ = rpte.issue(player, btc_token, 1000000u64);
 
     // 部署双向借贷合约（USDT + BTC 双池，交叉质押）
     let lending = LendingPreset::new_bidirectional(
@@ -230,6 +229,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dusdt_token = rpte.get_token_by_name("dUSDT").unwrap();
     let dbtc_token = rpte.get_token_by_name("dBTC").unwrap();
     bot_manager.set_lending_tokens(usdt_token, btc_token, ausdt_token, abtc_token, dusdt_token, dbtc_token);
+
+    // ── 给 USDT-BTC 交易对设手续费，收给 player ──
+    use rpte::taker_maker_fee;
+    // 先触发自动创建 USDT-BTC 交易对
+    let _ = rpte.get_current_price(usdt_token, btc_token).unwrap();
+    rpte.step();
+    // 找到刚创建的 USDT-BTC 交易对
+    let pairs = rpte.get_all_pairs_info();
+    for (pid, quote, base, _) in &pairs {
+        if *quote == usdt_token && *base == btc_token {
+            let fee = taker_maker_fee(
+                Decimal::new(1, 10),  // 万分之0.1 ≈ 0.001%
+                Decimal::ZERO,         // maker 免费
+                player,
+            );
+            rpte.set_pair_fee(*pid, Some(fee)).unwrap();
+            eprintln!("[Fee] USDT-BTC pair {} fee set, collecting to player {}", pid, player);
+            break;
+        }
+    }
 
     tui::run_tui(&mut rpte, 20, 120, 10, Some(player), |eng| {
         bot_manager.step(eng);

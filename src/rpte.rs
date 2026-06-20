@@ -472,6 +472,19 @@ impl Rpte {
         self.get_pair_node(pair_id).map(|p| p.get_base_token())
     }
 
+    /// 设置交易对（普通或虚拟）的手续费闭包
+    pub fn set_pair_fee(&mut self, pair_id: usize, fee_fn: Option<crate::fee::FeeFn>) -> Result<()> {
+        if pair_id >= self.nodes.len() {
+            return Err(Error::NodeNotFound { id: pair_id, len: self.nodes.len() });
+        }
+        if let Some(pair) = self.nodes[pair_id].as_pair_node() {
+            pair.set_fee_fn(fee_fn);
+            Ok(())
+        } else {
+            Err(Error::NotAPairNode(pair_id))
+        }
+    }
+
     pub fn get_all_orders(&self) -> Vec<usize> {
         self.registered_orders.iter()
             .filter(|&&id| id < self.nodes.len() && self.nodes[id].is_open())
@@ -1187,8 +1200,15 @@ impl Rpte {
                             eprintln!("WARNING: OpenOrder transfer failed: {e}");
                         }
                         if let Ok(brief) = self.get_order_brief(new_order_id) {
-                            if let Ok(pair) = self.get_pair_node(pair_node_id) {
-                                pair.insert_brief(brief.clone());
+                            let self_ptr: *const Self = self;
+                            let pair_node_id = pair_node_id;
+                            let brief_clone = brief.clone();
+                            if let Some(pair) = self.nodes[pair_node_id].as_pair_node() {
+                                // SAFETY: EngineReader only reads non-nodes fields
+                                // (token registries, precision, config data) which are
+                                // disjoint from the nodes field being mutated here.
+                                let reader: &dyn EngineReader = unsafe { &*self_ptr };
+                                pair.insert_brief(brief_clone, reader);
                             }
                             if let Ok(account) = self.get_account_node(owner_node_id) {
                                 account.insert_order(new_order_id);
@@ -1272,6 +1292,9 @@ impl Rpte {
                     Msg::Issue { token, account_id, volume } => {
                         let _ = self.issue(account_id, token, volume);
                     }
+                    Msg::SetPairFee { pair_id, fee_fn } => {
+                        let _ = self.set_pair_fee(pair_id, fee_fn);
+                    }
                 }
             }
 
@@ -1300,14 +1323,12 @@ impl Rpte {
                 if swaps.len() == 1 {
                     let (owner_id, volume) = swaps[0];
                     let (transfers, close_ids) = {
-                        let pair = match self.get_pair_node(pair_node_id) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!("ERROR: SwapOrder: {e}");
-                                continue;
-                            }
-                        };
-                        pair.process_swap(owner_id, direction, volume)
+                        let self_ptr: *const Self = self;
+                        let pair = self.nodes[pair_node_id].as_pair_node()
+                            .expect("pair_node_id not a PairNode");
+                        // SAFETY: EngineReader only reads non-nodes fields
+                        let reader: &dyn EngineReader = unsafe { &*self_ptr };
+                        pair.process_swap(owner_id, direction, volume, reader)
                     };
 
                     for t in transfers {
@@ -1323,14 +1344,12 @@ impl Rpte {
                     }
                 } else {
                     let (transfers, close_ids) = {
-                        let pair = match self.get_pair_node(pair_node_id) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!("ERROR: SwapOrder batch: {e}");
-                                continue;
-                            }
-                        };
-                        pair.process_swaps_batch(direction, &swaps)
+                        let self_ptr: *const Self = self;
+                        let pair = self.nodes[pair_node_id].as_pair_node()
+                            .expect("pair_node_id not a PairNode");
+                        // SAFETY: EngineReader only reads non-nodes fields
+                        let reader: &dyn EngineReader = unsafe { &*self_ptr };
+                        pair.process_swaps_batch(direction, &swaps, reader)
                     };
 
                     for t in transfers {

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use rust_decimal::Decimal;
-use crate::node::{Node, Msg, Drt, PairNode, OrderBookDepth, SwapTransfer};
+use crate::node::{EngineReader, Node, Msg, Drt, PairNode, OrderBookDepth, SwapTransfer};
 use crate::order::OrderBrief;
 use crate::order_book::OrderBook;
 use crate::pair::{TraLog, CandleData};
@@ -26,6 +26,8 @@ pub struct VirtualPair {
     contract_slave_id: usize,
     /// 绑定的 CalledFn 索引
     fn_id: u8,
+
+    fee_fn: Option<crate::fee::FeeFn>,
 
     order_book: OrderBook,
     tra_logs: VecDeque<TraLog>,
@@ -55,6 +57,7 @@ impl VirtualPair {
             swap_only,
             contract_slave_id,
             fn_id,
+            fee_fn: None,
             order_book: OrderBook::new(),
         }
     }
@@ -87,8 +90,6 @@ impl Node for VirtualPair {
 
     fn update(&mut self, step_count: u64) {
         self.step_count = step_count;
-        // 每帧撮合：遍历订单簿，价格满足即发 CallContract + CloseOrder
-        self.match_virtual_orders();
     }
 }
 
@@ -97,6 +98,10 @@ impl PairNode for VirtualPair {
     fn get_base_token(&self) -> usize { self.base_token }
     fn get_current_price(&self) -> Decimal { self.price }
     fn set_current_price(&mut self, price: Decimal) { self.price = price; }
+
+    fn set_fee_fn(&mut self, fee_fn: Option<crate::fee::FeeFn>) {
+        self.fee_fn = fee_fn;
+    }
 
     fn get_order_book(&self, direction: Drt, depth: usize) -> OrderBookDepth {
         let depth_data = self.order_book.get_depth(direction, depth + 1);
@@ -224,7 +229,7 @@ impl PairNode for VirtualPair {
         }
     }
 
-    fn insert_brief(&mut self, brief: OrderBrief) {
+    fn insert_brief(&mut self, brief: OrderBrief, reader: &dyn EngineReader) {
         if self.swap_only {
             // swap_only 模式：限价单直接按市价处理，忽略价格
             let vol = if brief.direction == Drt::Buy {
@@ -239,23 +244,53 @@ impl PairNode for VirtualPair {
                 volume: vol,
             });
             self.push_tra_log(self.step_count, brief.id, self.contract_slave_id, self.price, brief.src_volume);
+            // 手续费（swap_only 路径：买方向 brief.id 收到 base_token，卖方 slave_id 收到 quote_token）
+            if let Some(ref fee_fn) = self.fee_fn {
+                let (buyer, seller) = if brief.direction == Drt::Buy {
+                    (brief.id, self.contract_slave_id)
+                } else {
+                    (self.contract_slave_id, brief.id)
+                };
+                let (base_vol, quote_vol) = if brief.direction == Drt::Buy {
+                    (brief.src_volume / self.price, brief.src_volume)
+                } else {
+                    (brief.src_volume, brief.src_volume * self.price)
+                };
+                let fee_msgs = fee_fn(reader, crate::fee::FeeCtx {
+                    base_token: self.base_token,
+                    quote_token: self.quote_token,
+                    buyer_node: buyer,
+                    seller_node: seller,
+                    taker_node: brief.id,
+                    maker_node: self.contract_slave_id,
+                    base_volume: base_vol,
+                    quote_volume: quote_vol,
+                });
+                self.msgs.extend(fee_msgs);
+            }
             self.send_msg(Msg::CloseOrder { order_id: brief.id });
             return;
         }
         self.order_book.insert(&brief);
         // 新订单插入时立即撮合
-        self.match_virtual_orders();
+        self.match_virtual_orders(reader);
     }
 
     fn cancel_brief(&mut self, id: usize) {
         self.order_book.cancel(id);
     }
 
-    fn match_orders(&mut self) {
-        self.match_virtual_orders();
+    fn match_orders(&mut self, reader: &dyn EngineReader) {
+        self.match_virtual_orders(reader);
     }
 
-    fn process_swap(&mut self, owner_id: usize, direction: Drt, volume: Decimal) -> (Vec<SwapTransfer>, Vec<usize>) {
+    fn process_swap(
+        &mut self,
+        owner_id: usize,
+        direction: Drt,
+        volume: Decimal,
+        reader: &dyn EngineReader,
+    ) -> (Vec<SwapTransfer>, Vec<usize>) {
         // 市价单委托给合约：Buy → 正 volume（存款），Sell → 负 volume（取款）
         // Sell 方向时 volume 是 base token 量，需转换为 quote token 量
         let vol = if direction == Drt::Buy {
@@ -270,10 +305,39 @@ impl PairNode for VirtualPair {
             volume: vol,
         });
         self.push_tra_log(self.step_count, owner_id, self.contract_slave_id, self.price, volume);
+        // 手续费
+        if let Some(ref fee_fn) = self.fee_fn {
+            let (buyer, seller) = if direction == Drt::Buy {
+                (owner_id, self.contract_slave_id)
+            } else {
+                (self.contract_slave_id, owner_id)
+            };
+            let (base_vol, quote_vol) = if direction == Drt::Buy {
+                (volume / self.price, volume)
+            } else {
+                (volume, volume * self.price)
+            };
+            let fee_msgs = fee_fn(reader, crate::fee::FeeCtx {
+                base_token: self.base_token,
+                quote_token: self.quote_token,
+                buyer_node: buyer,
+                seller_node: seller,
+                taker_node: owner_id,
+                maker_node: self.contract_slave_id,
+                base_volume: base_vol,
+                quote_volume: quote_vol,
+            });
+            self.msgs.extend(fee_msgs);
+        }
         (Vec::new(), Vec::new())
     }
 
-    fn process_swaps_batch(&mut self, direction: Drt, swaps: &[(usize, Decimal)]) -> (Vec<SwapTransfer>, Vec<usize>) {
+    fn process_swaps_batch(
+        &mut self,
+        direction: Drt,
+        swaps: &[(usize, Decimal)],
+        reader: &dyn EngineReader,
+    ) -> (Vec<SwapTransfer>, Vec<usize>) {
         // Sell 方向时 volume 是 base token 量，需转换为 quote token 量
         let vol_sign = if direction == Drt::Buy { Decimal::ONE } else { -Decimal::ONE };
         for &(owner_id, volume) in swaps {
@@ -289,13 +353,37 @@ impl PairNode for VirtualPair {
                 volume: vol * vol_sign,
             });
             self.push_tra_log(self.step_count, owner_id, self.contract_slave_id, self.price, volume);
+            // 手续费
+            if let Some(ref fee_fn) = self.fee_fn {
+                let (buyer, seller) = if direction == Drt::Buy {
+                    (owner_id, self.contract_slave_id)
+                } else {
+                    (self.contract_slave_id, owner_id)
+                };
+                let (base_vol, quote_vol) = if direction == Drt::Buy {
+                    (volume / self.price, volume)
+                } else {
+                    (volume, volume * self.price)
+                };
+                let fee_msgs = fee_fn(reader, crate::fee::FeeCtx {
+                    base_token: self.base_token,
+                    quote_token: self.quote_token,
+                    buyer_node: buyer,
+                    seller_node: seller,
+                    taker_node: owner_id,
+                    maker_node: self.contract_slave_id,
+                    base_volume: base_vol,
+                    quote_volume: quote_vol,
+                });
+                self.msgs.extend(fee_msgs);
+            }
         }
         (Vec::new(), Vec::new())
     }
 }
 
 impl VirtualPair {
-    fn match_virtual_orders(&mut self) {
+    fn match_virtual_orders(&mut self, reader: &dyn EngineReader) {
         let eps = Decimal::new(1, 12);
         let slave_id = self.contract_slave_id;
         let fn_id = self.fn_id;
@@ -321,6 +409,22 @@ impl VirtualPair {
                 volume: buy.src_volume,
             });
             self.push_tra_log(self.step_count, buy.id, slave_id, self.price, buy.src_volume);
+            // 手续费（买单：买方 buy.id 收到 base_token，卖方 slave_id 收到 quote_token）
+            if let Some(ref fee_fn) = self.fee_fn {
+                let base_vol = buy.src_volume / self.price;
+                let quote_vol = buy.src_volume;
+                let fee_msgs = fee_fn(reader, crate::fee::FeeCtx {
+                    base_token: self.base_token,
+                    quote_token: self.quote_token,
+                    buyer_node: buy.id,
+                    seller_node: slave_id,
+                    taker_node: buy.id,
+                    maker_node: self.contract_slave_id,
+                    base_volume: base_vol,
+                    quote_volume: quote_vol,
+                });
+                self.msgs.extend(fee_msgs);
+            }
             self.send_msg(Msg::CloseOrder { order_id: buy.id });
         }
 
@@ -342,6 +446,22 @@ impl VirtualPair {
                 volume: sell_vol,
             });
             self.push_tra_log(self.step_count, slave_id, sell.id, self.price, sell.src_volume);
+            // 手续费（卖单：买方 buy.id 收到 base_token，卖方 slave_id 收到 quote_token）
+            if let Some(ref fee_fn) = self.fee_fn {
+                let base_vol = sell.src_volume;
+                let quote_vol = sell.src_volume * self.price;
+                let fee_msgs = fee_fn(reader, crate::fee::FeeCtx {
+                    base_token: self.base_token,
+                    quote_token: self.quote_token,
+                    buyer_node: slave_id,
+                    seller_node: sell.id,
+                    taker_node: sell.id,
+                    maker_node: self.contract_slave_id,
+                    base_volume: base_vol,
+                    quote_volume: quote_vol,
+                });
+                self.msgs.extend(fee_msgs);
+            }
             self.send_msg(Msg::CloseOrder { order_id: sell.id });
         }
 

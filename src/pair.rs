@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
-use crate::node::{Node, Msg, Drt, PairNode, OrderBookDepth, SwapTransfer};
+use crate::node::{Node, Msg, Drt, PairNode, OrderBookDepth, SwapTransfer, EngineReader};
 use crate::order::OrderBrief;
 use crate::order_book::OrderBook;
 
@@ -41,6 +41,8 @@ pub struct Pair {
 
     order_book: OrderBook,
     tra_logs: VecDeque<TraLog>,
+    /// 手续费闭包
+    fee_fn: Option<crate::fee::FeeFn>,
 }
 
 
@@ -58,6 +60,7 @@ impl Pair {
             base_token,
             price,
             order_book: OrderBook::new(),
+            fee_fn: None,
         }
     }
 
@@ -93,7 +96,11 @@ impl PairNode for Pair {
     fn get_quote_token(&self) -> usize { self.quote_token }
     fn get_base_token(&self) -> usize { self.base_token }
     fn get_current_price(&self) -> Decimal { self.price }
-    
+
+    fn set_fee_fn(&mut self, fee_fn: Option<crate::fee::FeeFn>) {
+        self.fee_fn = fee_fn;
+    }
+
     fn get_order_book(&self, direction: Drt, depth: usize) -> OrderBookDepth {
         let depth_data = self.order_book.get_depth(direction, depth + 1);
         if let Some((price, volume)) = depth_data.get(depth) {
@@ -224,17 +231,17 @@ impl PairNode for Pair {
         }
     }
 
-    fn insert_brief(&mut self, brief: OrderBrief) {
+    fn insert_brief(&mut self, brief: OrderBrief, reader: &dyn EngineReader) {
         // 新订单插入订单簿并触发撮合
         self.order_book.insert(&brief);
-        self.match_orders();
+        self.match_orders(reader);
     }
 
     fn cancel_brief(&mut self, id: usize) {
         self.order_book.cancel(id);
     }
 
-    fn match_orders(&mut self) {
+    fn match_orders(&mut self, reader: &dyn EngineReader) {
         let eps = Decimal::new(1, 12); // 1e-12
         let min_unit = Decimal::new(1, self.precision as u32);
         let mut match_price = self.price;
@@ -308,6 +315,28 @@ impl PairNode for Pair {
 
             self.push_tra_log(self.step_count, buy.id, sell.id, self.round(match_price), match_base_volume);
 
+            // 手续费：收取买方部分 base_token、卖方部分 quote_token
+            if let Some(ref fee_fn) = self.fee_fn {
+                let (taker_node, maker_node) = if buy.step_count_created > sell.step_count_created {
+                    (buy.id, sell.id)
+                } else {
+                    (sell.id, buy.id)
+                };
+                let fee_msgs = fee_fn(reader, crate::fee::FeeCtx {
+                    base_token: self.base_token,
+                    quote_token: self.quote_token,
+                    buyer_node: buy.id,
+                    seller_node: sell.id,
+                    taker_node,
+                    maker_node,
+                    base_volume: match_base_volume,
+                    quote_volume: match_quote_volume,
+                });
+                for msg in fee_msgs {
+                    self.send_msg(msg);
+                }
+            }
+
             // 计算剩余量 (use updated values from the cloned briefs)
             let buy_remaining = buy.src_volume - match_quote_volume;
             let sell_remaining = sell.src_volume - match_base_volume;
@@ -341,7 +370,7 @@ impl PairNode for Pair {
         self.price = self.round(match_price);
     }
 
-    fn process_swap(&mut self, owner_id: usize, direction: Drt, volume: Decimal) -> (Vec<SwapTransfer>, Vec<usize>) {
+    fn process_swap(&mut self, owner_id: usize, direction: Drt, volume: Decimal, reader: &dyn EngineReader) -> (Vec<SwapTransfer>, Vec<usize>) {
         let eps = Decimal::new(1, 12); // 1e-12
         let min_unit = Decimal::new(1, self.precision as u32);
         let mut transfers = Vec::new();
@@ -401,6 +430,20 @@ impl PairNode for Pair {
 
                 self.push_tra_log(self.step_count, owner_id, sell.id, sell.price, match_base);
                 self.price = self.round(sell.price);
+                // 手续费（Buy：买方 owner_id 收到 base_token，卖方 sell.id 收到 quote_token）
+                if let Some(ref fee_fn) = self.fee_fn {
+                    let fee_msgs = fee_fn(reader, crate::fee::FeeCtx {
+                        base_token: self.base_token,
+                        quote_token: self.quote_token,
+                        buyer_node: owner_id,
+                        seller_node: sell.id,
+                        taker_node: owner_id,
+                        maker_node: sell.id,
+                        base_volume: match_base,
+                        quote_volume: match_quote,
+                    });
+                    self.msgs.extend(fee_msgs);
+                }
 
                 remaining -= match_quote;
 
@@ -462,6 +505,21 @@ impl PairNode for Pair {
                 self.push_tra_log(self.step_count, buy.id, owner_id, buy.price, match_base);
                 self.price = self.round(buy.price);
 
+                // 手续费（Sell：买方 buy.id 收到 base_token，卖方 owner_id 收到 quote_token）
+                if let Some(ref fee_fn) = self.fee_fn {
+                    let fee_msgs = fee_fn(reader, crate::fee::FeeCtx {
+                        base_token: self.base_token,
+                        quote_token: self.quote_token,
+                        buyer_node: buy.id,
+                        seller_node: owner_id,
+                        taker_node: owner_id,
+                        maker_node: buy.id,
+                        base_volume: match_base,
+                        quote_volume: match_quote,
+                    });
+                    self.msgs.extend(fee_msgs);
+                }
+
                 remaining -= match_base;
 
                 let buy_remaining = buy.src_volume - match_quote;
@@ -479,7 +537,7 @@ impl PairNode for Pair {
 
     /// 批量按比例分配市价单撮合。
     /// 同帧内所有 swap 共享流动性，按剩余需求比例分配每个价位的流动性。
-    fn process_swaps_batch(&mut self, direction: Drt, swaps: &[(usize, Decimal)]) -> (Vec<SwapTransfer>, Vec<usize>) {
+    fn process_swaps_batch(&mut self, direction: Drt, swaps: &[(usize, Decimal)], reader: &dyn EngineReader) -> (Vec<SwapTransfer>, Vec<usize>) {
         let eps = Decimal::new(1, 12);
         let min_unit = Decimal::new(1, self.precision as u32);
         let mut transfers = Vec::new();
@@ -610,6 +668,26 @@ impl PairNode for Pair {
                     (ob.id, swaps[i].0, match_source)
                 };
                 self.push_tra_log(self.step_count, buy_node, sell_node, ob.price, log_volume);
+
+                // 手续费
+                if let Some(ref fee_fn) = self.fee_fn {
+                    let (base_vol, quote_vol) = if direction == Drt::Buy {
+                        (match_dest, match_source)
+                    } else {
+                        (match_source, match_dest)
+                    };
+                    let fee_msgs = fee_fn(reader, crate::fee::FeeCtx {
+                        base_token: self.base_token,
+                        quote_token: self.quote_token,
+                        buyer_node: buy_node,
+                        seller_node: sell_node,
+                        taker_node: swaps[i].0,
+                        maker_node: ob.id,
+                        base_volume: base_vol,
+                        quote_volume: quote_vol,
+                    });
+                    self.msgs.extend(fee_msgs);
+                }
 
                 remain[i] -= match_source;
                 order_consumed_src += order_delta;
