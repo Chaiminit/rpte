@@ -243,6 +243,7 @@ pub enum Msg {
         dst_token: usize,
         volume: Decimal,
         price: Decimal,
+        pair_id: Option<usize>,
     },
     SwapOrder {
         src_id: usize,
@@ -250,6 +251,7 @@ pub enum Msg {
         src_token: usize,
         dst_token: usize,
         volume: Decimal,
+        pair_id: Option<usize>,
     },
     CloseOrder {
         order_id: usize,

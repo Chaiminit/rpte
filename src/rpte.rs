@@ -12,6 +12,7 @@ use crate::contract::Contract;
 use std::mem::take;
 use crate::order::{Order, OrderBrief, OrderType};
 use crate::pair::{TraLog, CandleData};
+use crate::route::Route;
 
 
 pub struct Rpte {
@@ -553,21 +554,30 @@ impl Rpte {
     }
 
     /// 获取当前价格。
-    /// 返回 `(price, quote_token, base_token)`，含义为 1 base_token = price quote_token。
-    pub fn get_current_price(&mut self, src_token: usize, dst_token: usize) -> Result<(Decimal, usize, usize)> {
-        let (pair_id, _) = self.get_or_create_pair(src_token, dst_token)?;
-        let pair = self.get_pair_node(pair_id)?;
-        Ok((pair.get_current_price(), pair.get_quote_token(), pair.get_base_token()))
+    /// 返回 `Vec<(price, quote_token, base_token)>`，含义为 1 base_token = price quote_token。
+    /// 若 route.pair_id = Some(pid)：验证 pid 对应 (src,dst)，返回一条结果
+    /// 若 route.pair_id = None：遍历所有匹配交易对，返回全部结果
+    pub fn get_current_price(&mut self, route: Route) -> Result<Vec<(Decimal, usize, usize)>> {
+        let pairs = self.resolve_pairs(&route)?;
+        let mut results = Vec::new();
+        for (pair_id, _is_forward) in pairs {
+            let pair = self.get_pair_node(pair_id)?;
+            results.push((pair.get_current_price(), pair.get_quote_token(), pair.get_base_token()));
+        }
+        Ok(results)
     }
 
     /// 获取订单簿深度。
-    /// `src_token` 为支出代币，`dst_token` 为收入代币，由引擎自行推导买卖方向。
-    pub fn get_order_book(&mut self, src_token: usize, dst_token: usize, depth: usize) -> Result<OrderBookDepth> {
-        let (pair_id, is_forward) = self.get_or_create_pair(src_token, dst_token)?;
-        // forward: src=quote, dst=base → Buy (支出 quote 买入 base)
-        // reverse: src=base, dst=quote → Sell (卖出 base 获取 quote)
-        let direction = if is_forward { Drt::Buy } else { Drt::Sell };
-        Ok(self.get_pair_node(pair_id)?.get_order_book(direction, depth))
+    /// `route` 指定源/目标代币及可选的交易对。
+    /// 返回 Vec<OrderBookDepth>（若 route.pair_id = None，每个交易对一个 OrderBookDepth）。
+    pub fn get_order_book(&mut self, route: Route, depth: usize) -> Result<Vec<OrderBookDepth>> {
+        let pairs = self.resolve_pairs(&route)?;
+        let mut results = Vec::new();
+        for (pair_id, is_forward) in pairs {
+            let direction = if is_forward { Drt::Buy } else { Drt::Sell };
+            results.push(self.get_pair_node(pair_id)?.get_order_book(direction, depth));
+        }
+        Ok(results)
     }
 
     // ========== 账户操作代理方法 ==========
@@ -593,28 +603,30 @@ impl Rpte {
     }
 
     /// 创建限价单
-    pub fn make(&mut self, src_id: usize, src_token: usize, dst_token: usize, volume: impl Into<Decimal>, price: impl Into<Decimal>) {
+    pub fn make(&mut self, src_id: usize, volume: impl Into<Decimal>, price: impl Into<Decimal>, route: Route) {
         let volume = self.round(volume.into());
         let price = self.round(price.into());
         self.msgs.push(Msg::OpenOrder {
             src_id,
             owner_node_id: src_id,
-            src_token,
-            dst_token,
+            src_token: route.src_token,
+            dst_token: route.dst_token,
             volume,
             price,
+            pair_id: route.pair_id,
         });
     }
 
     /// 创建市价单
-    pub fn swap(&mut self, src_id: usize, src_token: usize, dst_token: usize, volume: impl Into<Decimal>) {
+    pub fn swap(&mut self, src_id: usize, volume: impl Into<Decimal>, route: Route) {
         let volume = self.round(volume.into());
         self.msgs.push(Msg::SwapOrder {
             src_id,
             owner_node_id: src_id,
-            src_token,
-            dst_token,
+            src_token: route.src_token,
+            dst_token: route.dst_token,
             volume,
+            pair_id: route.pair_id,
         });
     }
 
@@ -696,6 +708,31 @@ impl Rpte {
         Ok((pair_id, is_forward))
     }
 
+    /// 解析 Route：返回所有匹配交易对的 (pair_id, is_forward) 列表。
+    /// is_forward = true 表示 route.src_token 等于 pair.quote_token
+    fn resolve_pairs(&mut self, route: &Route) -> Result<Vec<(usize, bool)>> {
+        let src = route.src_token;
+        let dst = route.dst_token;
+        if let Some(pid) = route.pair_id {
+            // 指定了交易对 ID：验证并返回一条结果
+            if self.registered_pairs.contains(&pid) || self.registered_virtual_pairs.contains(&pid) {
+                let pair = self.get_pair_node(pid)?;
+                let qt = pair.get_quote_token();
+                let bt = pair.get_base_token();
+                if (qt == src && bt == dst) || (qt == dst && bt == src) {
+                    let is_forward = qt == src;
+                    return Ok(vec![(pid, is_forward)]);
+                }
+                return Err(Error::PairNotFound(pid));
+            }
+            return Err(Error::PairNotFound(pid));
+        }
+        // Auto: 查找或自动创建
+        let (pair_id, is_forward) = self.get_or_create_pair(src, dst)?;
+        Ok(vec![(pair_id, is_forward)])
+    }
+
+    /// 解析 Route 并返回 pair_id。指定 pair_id 则验证，否则 auto 创建/选择。
     /// 截断到引擎精度
     pub fn round(&self, value: Decimal) -> Decimal {
         value.round_dp_with_strategy(self.precision as u32, RoundingStrategy::ToZero)
@@ -1036,19 +1073,36 @@ impl Rpte {
         }
     }
 
-    pub fn get_tra_logs(&mut self, src_token: usize, dst_token: usize) -> Result<VecDeque<TraLog>> {
-        let (pair_id, _) = self.get_or_create_pair(src_token, dst_token)?;
-        Ok(self.get_pair_node(pair_id)?.get_tra_logs().clone())
+    /// 获取成交记录。
+    /// 若 route.pair_id = Some(pid)：返回单条 VecDeque
+    /// 若 route.pair_id = None：遍历所有匹配交易对，返回全部 Vec<VecDeque<TraLog>>
+    pub fn get_tra_logs(&mut self, route: Route) -> Result<Vec<VecDeque<TraLog>>> {
+        let pairs = self.resolve_pairs(&route)?;
+        let mut results = Vec::new();
+        for (pair_id, _) in pairs {
+            results.push(self.get_pair_node(pair_id)?.get_tra_logs().clone());
+        }
+        Ok(results)
     }
 
-    pub fn get_candle_data(&mut self, src_token: usize, dst_token: usize, interval: u64) -> Result<VecDeque<CandleData>> {
-        let (pair_id, _) = self.get_or_create_pair(src_token, dst_token)?;
-        Ok(self.get_pair_node(pair_id)?.get_candle_data(interval))
+    /// 获取 K 线数据。
+    pub fn get_candle_data(&mut self, route: Route, interval: u64) -> Result<Vec<VecDeque<CandleData>>> {
+        let pairs = self.resolve_pairs(&route)?;
+        let mut results = Vec::new();
+        for (pair_id, _) in pairs {
+            results.push(self.get_pair_node(pair_id)?.get_candle_data(interval));
+        }
+        Ok(results)
     }
 
-    pub fn latest_candle(&mut self, src_token: usize, dst_token: usize, interval: u64) -> Result<Option<CandleData>> {
-        let (pair_id, _) = self.get_or_create_pair(src_token, dst_token)?;
-        Ok(self.get_pair_node(pair_id)?.latest_candle(interval))
+    /// 获取最新 K 线。
+    pub fn latest_candle(&mut self, route: Route, interval: u64) -> Result<Vec<Option<CandleData>>> {
+        let pairs = self.resolve_pairs(&route)?;
+        let mut results = Vec::new();
+        for (pair_id, _) in pairs {
+            results.push(self.get_pair_node(pair_id)?.latest_candle(interval));
+        }
+        Ok(results)
     }
 
     fn _update_order_for_pairs(&mut self, order_id: usize) -> Result<()> {
@@ -1171,7 +1225,7 @@ impl Rpte {
                     Msg::CallContract { .. } => {
                         call_contract_msgs.push(msg);
                     }
-                    Msg::OpenOrder { src_id, owner_node_id, src_token, dst_token, volume, price } => {
+                    Msg::OpenOrder { src_id, owner_node_id, src_token, dst_token, volume, price, .. } => {
                         let can_neg = self.get_token_can_be_negative(src_token);
                         if volume.is_zero() || price.is_zero() || (!can_neg && volume > self.get_node_balance(src_id, src_token).unwrap_or(Decimal::ZERO)) {
                             continue;
@@ -1215,7 +1269,7 @@ impl Rpte {
                             }
                         }
                     }
-                    Msg::SwapOrder { src_id: _, owner_node_id, src_token, dst_token, volume } => {
+                    Msg::SwapOrder { src_id: _, owner_node_id, src_token, dst_token, volume, .. } => {
                         let (pair_node_id, _) = match self.get_or_create_pair(src_token, dst_token) {
                             Ok(v) => v,
                             Err(e) => {

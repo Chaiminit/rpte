@@ -43,6 +43,8 @@ pub enum Error {
     IndexOutOfBounds { id: usize, len: usize },
     /// 代币交换不被允许（白名单限制）
     SwapNotAllowed { src: usize, dst: usize },
+    /// 交易对未找到
+    PairNotFound(usize),
 }
 
 impl fmt::Display for Error {
@@ -104,7 +106,13 @@ impl fmt::Display for Error {
                 write!(f, "index {id} out of bounds (len={len})")
             }
             Error::SwapNotAllowed { src, dst } => {
-                write!(f, "swap not allowed: token {src} ↔ token {dst} (whitelist restriction)")
+                write!(
+                    f,
+                    "swap not allowed: token {src} ↔ token {dst} (whitelist restriction)"
+                )
+            }
+            Error::PairNotFound(id) => {
+                write!(f, "pair {id} not found")
             }
         }
     }

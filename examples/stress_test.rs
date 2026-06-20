@@ -12,6 +12,7 @@ use rand::Rng;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use rpte::Rpte;
+use rpte::Route;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -131,7 +132,12 @@ impl BotManager {
                 }
             };
 
-            let Ok((pair_price, quote, _base)) = rpte.get_current_price(src_token, dst_token) else {
+            // get_current_price now returns Vec, take first entry
+            let pair_prices = match rpte.get_current_price(Route::auto(src_token, dst_token)) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some((pair_price, quote, _base)) = pair_prices.into_iter().next() else {
                 continue;
             };
 
@@ -147,7 +153,7 @@ impl BotManager {
             let (is_swap, _, price_ratio) = random_bot();
 
             if is_swap {
-                rpte.swap(bot, src_token, dst_token, volume);
+                rpte.swap(bot, volume, Route::auto(src_token, dst_token));
                 self.step_swap_count += 1;
             } else {
                 let price = if src_token == quote {
@@ -155,7 +161,7 @@ impl BotManager {
                 } else {
                     pair_price * (Decimal::ONE + price_ratio)
                 };
-                rpte.make(bot, src_token, dst_token, volume, price);
+                rpte.make(bot, volume, price, Route::auto(src_token, dst_token));
                 self.step_make_count += 1;
             }
         }
@@ -315,19 +321,37 @@ fn run_scenario(sc: &Scenario) {
         }
 
         // --- 采集指标 ---
-        let price = rpte.get_current_price(usdt, btc).unwrap().0;
+        let price = rpte.get_current_price(Route::auto(usdt, btc)).unwrap()[0].0;
         let price_f64 = decimal_to_f64(price);
 
         // 订单总数
         let order_count = rpte.get_all_orders().len();
 
         // 多级深度: best 1, 3, 5
-        let ob1_buy = rpte.get_order_book(usdt, btc, 0).unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
-        let ob1_sell = rpte.get_order_book(btc, usdt, 0).unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
-        let ob3_buy = rpte.get_order_book(usdt, btc, 2).unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
-        let ob3_sell = rpte.get_order_book(btc, usdt, 2).unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
-        let ob5_buy = rpte.get_order_book(usdt, btc, 4).unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
-        let ob5_sell = rpte.get_order_book(btc, usdt, 4).unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
+        let ob1_buy = rpte.get_order_book(Route::auto(usdt, btc), 0)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
+        let ob1_sell = rpte.get_order_book(Route::auto(btc, usdt), 0)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
+        let ob3_buy = rpte.get_order_book(Route::auto(usdt, btc), 2)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
+        let ob3_sell = rpte.get_order_book(Route::auto(btc, usdt), 2)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
+        let ob5_buy = rpte.get_order_book(Route::auto(usdt, btc), 4)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
+        let ob5_sell = rpte.get_order_book(Route::auto(btc, usdt), 4)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .unwrap_or(rpte::node::OrderBookDepth { price: Decimal::ZERO, volume: Decimal::ZERO });
 
         // 价差 (best ask / best bid - 1)
         let spread = if !ob1_buy.price.is_zero() && !ob1_sell.price.is_zero() {
@@ -345,7 +369,11 @@ fn run_scenario(sc: &Scenario) {
         }
 
         // 成交追踪
-        let tra_logs: VecDeque<rpte::pair::TraLog> = rpte.get_tra_logs(usdt, btc).unwrap_or_default();
+        let tra_logs: VecDeque<rpte::pair::TraLog> = rpte.get_tra_logs(Route::auto(usdt, btc))
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         let tra_log_len = tra_logs.len();
         if let Some(prev) = prev_tra_log_len {
             // 本步新增的成交
@@ -415,7 +443,7 @@ fn run_scenario(sc: &Scenario) {
     }
 
     // ========== 场景摘要输出 ==========
-    let final_price = rpte.get_current_price(usdt, btc).unwrap().0;
+    let final_price = rpte.get_current_price(Route::auto(usdt, btc)).unwrap()[0].0;
 
     let mut summary = JsonBuilder::new();
     summary.kv_str("type", "scenario_summary");

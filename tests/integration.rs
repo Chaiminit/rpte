@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use rpte::Rpte;
+use rpte::{Rpte, Route};
 
 // ============================
 // 基础引擎操作测试
@@ -134,7 +134,7 @@ fn test_make_order() {
     let alice = engine.register_account();
 
     engine.issue(alice, usdt, 10000u64).unwrap();
-    engine.make(alice, usdt, btc, 5000u64, 50000u64);
+    engine.make(alice, 5000u64, 50000u64, Route::auto(usdt, btc));
     engine.step();
 
     // 检查订单是否创建
@@ -152,12 +152,12 @@ fn test_make_and_match() {
 
     // Alice 以 50000 USDT/BTC 挂买单
     engine.issue(alice, usdt, 50000u64).unwrap();
-    engine.make(alice, usdt, btc, 50000u64, 50000u64);
+    engine.make(alice, 50000u64, 50000u64, Route::auto(usdt, btc));
     engine.step();
 
     // Bob 以 50000 USDT/BTC 挂卖单
     engine.issue(bob, btc, 1u64).unwrap();
-    engine.make(bob, btc, usdt, 1u64, 50000u64);
+    engine.make(bob, 1u64, 50000u64, Route::auto(btc, usdt));
     engine.step();
 
     // 再驱动一帧处理撮合产生的转账和关单消息
@@ -178,12 +178,12 @@ fn test_make_partial_fill() {
 
     // Alice 以 50000 挂买单，买入 1 BTC
     engine.issue(alice, usdt, 50000u64).unwrap();
-    engine.make(alice, usdt, btc, 50000u64, 50000u64);
+    engine.make(alice, 50000u64, 50000u64, Route::auto(usdt, btc));
     engine.step();
 
     // Bob 以 50000 挂卖单，只卖 0.5 BTC
     engine.issue(bob, btc, 1u64).unwrap();
-    engine.make(bob, btc, usdt, 1u64, 50000u64);
+    engine.make(bob, 1u64, 50000u64, Route::auto(btc, usdt));
     engine.step();
 
     // 再驱动一帧处理撮合消息
@@ -207,13 +207,13 @@ fn test_make_price_priority() {
     // 两个买单：Alice 出价 40000, Bob 出价 50000（更高）
     engine.issue(alice, usdt, 40000u64).unwrap();
     engine.issue(bob, usdt, 50000u64).unwrap();
-    engine.make(alice, usdt, btc, 40000u64, 40000u64);
-    engine.make(bob, usdt, btc, 50000u64, 50000u64);
+    engine.make(alice, 40000u64, 40000u64, Route::auto(usdt, btc));
+    engine.make(bob, 50000u64, 50000u64, Route::auto(usdt, btc));
     engine.step();
 
     // Charlie 以 45000 卖 1 BTC
     engine.issue(charlie, btc, 1u64).unwrap();
-    engine.make(charlie, btc, usdt, 1u64, 45000u64);
+    engine.make(charlie, 1u64, 45000u64, Route::auto(btc, usdt));
     engine.step();
 
     // 再驱动一帧处理撮合消息
@@ -237,13 +237,13 @@ fn test_swap_buy() {
 
     // Bob 挂限价卖单：以 50000 卖出 1 BTC
     engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
 
     // Alice 市价买入（花费 USDT 买入 BTC）
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
     let alice_balance_before = engine.get_node_balance(alice, btc).unwrap();
-    engine.swap(alice, usdt, btc, Decimal::new(50000, 0));
+    engine.swap(alice, Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     // 再驱动一帧处理撮合消息
@@ -263,13 +263,13 @@ fn test_swap_sell() {
 
     // Bob 挂限价买单：以 50000 买入 BTC
     engine.issue(bob, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(bob, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     // Alice 市价卖出 BTC
     engine.issue(alice, btc, Decimal::new(1, 0)).unwrap();
     let alice_usdt_before = engine.get_node_balance(alice, usdt).unwrap();
-    engine.swap(alice, btc, usdt, Decimal::new(1, 0));
+    engine.swap(alice, Decimal::new(1, 0), Route::auto(btc, usdt));
     engine.step();
 
     // 再驱动一帧处理撮合消息
@@ -288,7 +288,7 @@ fn test_swap_no_liquidity() {
 
     // 没有对手单，直接市价买入
     engine.issue(alice, usdt, Decimal::new(1000, 0)).unwrap();
-    engine.swap(alice, usdt, btc, Decimal::new(1000, 0));
+    engine.swap(alice, Decimal::new(1000, 0), Route::auto(usdt, btc));
     engine.step(); // 应该不会 panic，只是没有成交
 }
 
@@ -304,7 +304,7 @@ fn test_cancel_order() {
     let alice = engine.register_account();
 
     engine.issue(alice, usdt, Decimal::new(10000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(5000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(5000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     let orders = engine.get_all_orders();
@@ -360,21 +360,21 @@ fn test_get_current_price_returns_orientation() {
 
     // 撮合一笔 USDT/BTC 交易
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
     engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
     engine.step();
 
     // 正向: get_current_price(usdt, btc) → pair 的原始价格
-    let (price_fwd, quote_fwd, base_fwd) = engine.get_current_price(usdt, btc).unwrap();
+    let (price_fwd, quote_fwd, base_fwd) = engine.get_current_price(Route::auto(usdt, btc)).unwrap()[0];
     assert_eq!(price_fwd, Decimal::new(50000, 0), "1 BTC = 50000 USDT");
     assert_eq!(quote_fwd, usdt);
     assert_eq!(base_fwd, btc);
 
     // 反向: get_current_price(btc, usdt) → 返回同一 pair 的原始价格（不取倒数）
-    let (price_rev, quote_rev, base_rev) = engine.get_current_price(btc, usdt).unwrap();
+    let (price_rev, quote_rev, base_rev) = engine.get_current_price(Route::auto(btc, usdt)).unwrap()[0];
     assert_eq!(price_rev, Decimal::new(50000, 0), "反向查询仍返回 1 BTC = 50000 USDT");
     assert_eq!(quote_rev, usdt);
     assert_eq!(base_rev, btc);
@@ -389,16 +389,16 @@ fn test_get_order_book_direction_derived_from_src_dst() {
 
     // 正向挂买单: 花费 USDT 买 BTC → pair 内部为 Buy
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     // 正向: src=usdt(quote) → Buy 方向，返回买单簿
-    let depth = engine.get_order_book(usdt, btc, 0).unwrap();
-    assert_eq!(depth.price, Decimal::new(50000, 0));
+    let depth = engine.get_order_book(Route::auto(usdt, btc), 0).unwrap();
+    assert_eq!(depth[0].price, Decimal::new(50000, 0));
 
     // 反向: src=btc(base) → Sell 方向，返回卖单簿（空，因为只挂了买单）
-    let depth = engine.get_order_book(btc, usdt, 0).unwrap();
-    assert_eq!(depth.price, Decimal::ZERO, "反向查询返回卖单簿（未挂卖单）");
+    let depth = engine.get_order_book(Route::auto(btc, usdt), 0).unwrap();
+    assert_eq!(depth.first().map(|d| d.price).unwrap_or(Decimal::ZERO), Decimal::ZERO, "反向查询返回卖单簿（未挂卖单）");
 }
 
 // ============================
@@ -413,11 +413,11 @@ fn test_get_order_book() {
     let alice = engine.register_account();
 
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
-    let depth = engine.get_order_book(usdt, btc, 0).unwrap();
-    assert_eq!(depth.price, Decimal::new(50000, 0));
+    let depth = engine.get_order_book(Route::auto(usdt, btc), 0).unwrap();
+    assert_eq!(depth[0].price, Decimal::new(50000, 0));
 }
 
 // ============================
@@ -433,15 +433,15 @@ fn test_trade_logs() {
     let bob = engine.register_account();
 
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
 
-    let logs = engine.get_tra_logs(usdt, btc).unwrap();
-    assert!(!logs.is_empty(), "应有成交记录");
+    let logs = engine.get_tra_logs(Route::auto(usdt, btc)).unwrap();
+    assert!(!logs.is_empty() && !logs[0].is_empty(), "应有成交记录");
 }
 
 // ============================
@@ -457,15 +457,15 @@ fn test_candle_data() {
     let bob = engine.register_account();
 
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
 
-    let candles = engine.get_candle_data(usdt, btc, 1).unwrap();
-    assert!(!candles.is_empty(), "应有 K 线数据");
+    let candles = engine.get_candle_data(Route::auto(usdt, btc), 1).unwrap();
+    assert!(!candles.is_empty() && !candles[0].is_empty(), "应有 K 线数据");
 }
 
 #[test]
@@ -477,15 +477,15 @@ fn test_latest_candle() {
     let bob = engine.register_account();
 
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
 
-    let latest = engine.latest_candle(usdt, btc, 1).unwrap();
-    assert!(latest.is_some(), "应有最新 K 线");
+    let latest = engine.latest_candle(Route::auto(usdt, btc), 1).unwrap();
+    assert!(!latest.is_empty() && latest[0].is_some(), "应有最新 K 线");
 }
 
 // ============================
@@ -497,7 +497,7 @@ fn test_get_current_price_no_trades() {
     let mut engine = Rpte::new("USDT", 4);
     let usdt = engine.get_token_by_name("USDT").unwrap();
     let btc = engine.register_token("BTC");
-    let (price, _quote, _base) = engine.get_current_price(usdt, btc).unwrap();
+    let (price, _quote, _base) = engine.get_current_price(Route::auto(usdt, btc)).unwrap()[0];
     assert_eq!(price, Decimal::ONE, "无成交时价格应为 1");
 }
 
@@ -510,14 +510,14 @@ fn test_get_current_price_after_trades() {
     let bob = engine.register_account();
 
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
 
-    let (price, _quote, _base) = engine.get_current_price(usdt, btc).unwrap();
+    let (price, _quote, _base) = engine.get_current_price(Route::auto(usdt, btc)).unwrap()[0];
     assert!(price > Decimal::ZERO, "成交后应有非零价格");
 }
 
@@ -537,9 +537,9 @@ fn test_multiple_steps() {
     engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
 
     // 多帧分别下单
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
 
     // 再驱动一帧处理撮合消息
@@ -570,16 +570,16 @@ fn test_multiple_accounts_multiple_tokens() {
     engine.issue(charlie, eth, Decimal::new(100, 0)).unwrap();
 
     // Alice 买 BTC
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     // Bob 卖 BTC
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
 
     // Charlie 买 BTC (使用 ETH 不是 quote token，会创建 ETH/BTC 交易对)
     // 但注意 swap 需要 src_token 和 dst_token
-    engine.make(charlie, eth, btc, Decimal::new(50, 0), Decimal::new(0_05, 0));
+    engine.make(charlie, Decimal::new(50, 0), Decimal::new(0_05, 0), Route::auto(eth, btc));
     engine.step();
 
     let alice_btc = engine.get_node_balance(alice, btc).unwrap();
@@ -615,9 +615,9 @@ fn test_multiple_orders_continuous_matching() {
     engine.issue(bob, usdt, Decimal::new(40000, 0)).unwrap();
     engine.issue(charlie, usdt, Decimal::new(50000, 0)).unwrap();
 
-    engine.make(alice, usdt, btc, Decimal::new(30000, 0), Decimal::new(30000, 0));
-    engine.make(bob, usdt, btc, Decimal::new(40000, 0), Decimal::new(40000, 0));
-    engine.make(charlie, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(30000, 0), Decimal::new(30000, 0), Route::auto(usdt, btc));
+    engine.make(bob, Decimal::new(40000, 0), Decimal::new(40000, 0), Route::auto(usdt, btc));
+    engine.make(charlie, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     // Dave 以 35000 卖 2 BTC — 应该与 Bob (40000) 和 Alice (30000) 匹配
@@ -625,7 +625,7 @@ fn test_multiple_orders_continuous_matching() {
     // 然而 Dave 卖价 35000，所以只有出价 >= 35000 的买单才能成交
     let dave = engine.register_account();
     engine.issue(dave, btc, Decimal::new(2, 0)).unwrap();
-    engine.make(dave, btc, usdt, Decimal::new(2, 0), Decimal::new(35000, 0));
+    engine.make(dave, Decimal::new(2, 0), Decimal::new(35000, 0), Route::auto(btc, usdt));
     engine.step();
 
     // 再驱动一帧处理撮合消息
@@ -654,7 +654,7 @@ fn test_get_order_brief() {
     let alice = engine.register_account();
 
     engine.issue(alice, usdt, Decimal::new(10000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(5000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(5000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     let orders = engine.get_all_orders();
@@ -677,7 +677,7 @@ fn test_zero_volume_make() {
 
     engine.issue(alice, usdt, Decimal::new(100, 0)).unwrap();
     // 零数量限价单
-    engine.make(alice, usdt, btc, Decimal::ZERO, Decimal::new(50000, 0));
+    engine.make(alice, Decimal::ZERO, Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
     // 不应该 panic
 }
@@ -692,11 +692,11 @@ fn test_zero_price_make() {
 
     // 零价格限价单不应该导致除零崩溃
     engine.issue(alice, usdt, Decimal::new(100, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50, 0), Decimal::ZERO);
+    engine.make(alice, Decimal::new(50, 0), Decimal::ZERO, Route::auto(usdt, btc));
     engine.step();
 
     engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::ZERO);
+    engine.make(bob, Decimal::new(1, 0), Decimal::ZERO, Route::auto(btc, usdt));
     engine.step();
 
     // 不应该 panic
@@ -720,18 +720,18 @@ fn test_multiple_pairs() {
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
     engine.issue(bob, btc, Decimal::new(1, 0)).unwrap();
 
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
-    engine.make(bob, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(bob, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
 
     // USDT/ETH 交易对
     engine.issue(charlie, eth, Decimal::new(10, 0)).unwrap();
-    engine.make(charlie, eth, usdt, Decimal::new(10, 0), Decimal::new(3000, 0));
+    engine.make(charlie, Decimal::new(10, 0), Decimal::new(3000, 0), Route::auto(eth, usdt));
     engine.step();
 
-    let (btc_price, _quote, _base) = engine.get_current_price(usdt, btc).unwrap();
-    let (_eth_price, _eq, _eb) = engine.get_current_price(eth, usdt).unwrap();
+    let (btc_price, _quote, _base) = engine.get_current_price(Route::auto(usdt, btc)).unwrap()[0];
+    let (_eth_price, _eq, _eb) = engine.get_current_price(Route::auto(eth, usdt)).unwrap()[0];
 
     assert!(btc_price > Decimal::ZERO, "BTC price should be set");
 }
@@ -759,16 +759,16 @@ fn test_order_book_directions() {
 
     // 买单 (buy USDT/BTC = 花费 USDT 买 BTC)
     engine.issue(alice, usdt, Decimal::new(50000, 0)).unwrap();
-    engine.make(alice, usdt, btc, Decimal::new(50000, 0), Decimal::new(50000, 0));
+    engine.make(alice, Decimal::new(50000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
     engine.step();
 
     // 检查买单簿
-    let depth = engine.get_order_book(usdt, btc, 0).unwrap();
-    assert_eq!(depth.price, Decimal::new(50000, 0));
+    let depth = engine.get_order_book(Route::auto(usdt, btc), 0).unwrap();
+    assert_eq!(depth[0].price, Decimal::new(50000, 0));
 
     // 卖单簿应为空
-    let depth = engine.get_order_book(btc, usdt, 0).unwrap();
-    assert_eq!(depth.price, Decimal::ZERO);
+    let depth = engine.get_order_book(Route::auto(btc, usdt), 0).unwrap();
+    assert_eq!(depth.first().map(|d| d.price).unwrap_or(Decimal::ZERO), Decimal::ZERO);
 }
 
 // ============================
@@ -784,7 +784,7 @@ fn test_multiple_swaps_same_step_proportional() {
     // 一个做市商提供流动性：以 50000 卖出 1 BTC
     let maker = engine.register_account();
     engine.issue(maker, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(maker, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
     // 驱动一帧处理撮合消息（本帧没有对手单，仅挂单）
     engine.step();
@@ -799,9 +799,9 @@ fn test_multiple_swaps_same_step_proportional() {
     engine.issue(bot3, usdt, Decimal::new(50000, 0)).unwrap();
 
     // 全部在同一帧内发出 swap 买单（花费 USDT 买 BTC）
-    engine.swap(bot1, usdt, btc, Decimal::new(3000, 0));
-    engine.swap(bot2, usdt, btc, Decimal::new(5000, 0));
-    engine.swap(bot3, usdt, btc, Decimal::new(2000, 0));
+    engine.swap(bot1, Decimal::new(3000, 0), Route::auto(usdt, btc));
+    engine.swap(bot2, Decimal::new(5000, 0), Route::auto(usdt, btc));
+    engine.swap(bot3, Decimal::new(2000, 0), Route::auto(usdt, btc));
     // 总额 10000 USDT, 流动性 1 BTC = 50000 USDT，足够覆盖
     engine.step();
     // 再一帧处理 close order
@@ -844,12 +844,12 @@ fn test_multiple_swaps_same_step_competition() {
     // 做市商提供有限流动性：以 50000 卖出 1 BTC
     let maker = engine.register_account();
     engine.issue(maker, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(maker, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
     engine.step();
 
     // 做市商再挂一单：以 51000 卖出 1 BTC
-    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(51000, 0));
+    engine.make(maker, Decimal::new(1, 0), Decimal::new(51000, 0), Route::auto(btc, usdt));
     engine.step();
     engine.step();
 
@@ -863,9 +863,9 @@ fn test_multiple_swaps_same_step_competition() {
     engine.issue(bot3, usdt, Decimal::new(50000, 0)).unwrap();
 
     // 每个都想要大量 BTC，但流动性有限
-    engine.swap(bot1, usdt, btc, Decimal::new(500, 0));
-    engine.swap(bot2, usdt, btc, Decimal::new(300, 0));
-    engine.swap(bot3, usdt, btc, Decimal::new(200, 0));
+    engine.swap(bot1, Decimal::new(500, 0), Route::auto(usdt, btc));
+    engine.swap(bot2, Decimal::new(300, 0), Route::auto(usdt, btc));
+    engine.swap(bot3, Decimal::new(200, 0), Route::auto(usdt, btc));
     engine.step();
     engine.step();
 
@@ -895,7 +895,7 @@ fn test_multiple_swaps_and_openorders_same_step() {
     // 预先有流动性: 1 BTC @ 50000
     let maker = engine.register_account();
     engine.issue(maker, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(maker, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
     engine.step();
 
@@ -909,9 +909,9 @@ fn test_multiple_swaps_and_openorders_same_step() {
     engine.issue(bot2, usdt, Decimal::new(50000, 0)).unwrap();
 
     // 新流动性 + 2 个 swap 同时发生
-    engine.make(maker2, btc, usdt, Decimal::new(1, 0), Decimal::new(51000, 0));
-    engine.swap(bot1, usdt, btc, Decimal::new(500, 0));
-    engine.swap(bot2, usdt, btc, Decimal::new(500, 0));
+    engine.make(maker2, Decimal::new(1, 0), Decimal::new(51000, 0), Route::auto(btc, usdt));
+    engine.swap(bot1, Decimal::new(500, 0), Route::auto(usdt, btc));
+    engine.swap(bot2, Decimal::new(500, 0), Route::auto(usdt, btc));
     engine.step();
     engine.step();
 
@@ -935,7 +935,7 @@ fn test_swap_insufficient_balance_not_crash() {
 
     let maker = engine.register_account();
     engine.issue(maker, btc, Decimal::new(1, 0)).unwrap();
-    engine.make(maker, btc, usdt, Decimal::new(1, 0), Decimal::new(50000, 0));
+    engine.make(maker, Decimal::new(1, 0), Decimal::new(50000, 0), Route::auto(btc, usdt));
     engine.step();
     engine.step();
 
@@ -944,7 +944,7 @@ fn test_swap_insufficient_balance_not_crash() {
     engine.issue(bot, usdt, Decimal::new(10, 0)).unwrap();
 
     // 不会 panic
-    engine.swap(bot, usdt, btc, Decimal::new(100, 0));
+    engine.swap(bot, Decimal::new(100, 0), Route::auto(usdt, btc));
     engine.step();
     engine.step();
 

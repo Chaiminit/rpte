@@ -175,15 +175,16 @@ impl RandomBotManager {
 
             // swap_only 对强制市价单，其他随机市价/限价
             if swap_only || is_swap {
-                rpte.swap(*bot, src_token, dst_token, volume);
+                rpte.swap(*bot, volume, rpte::Route::auto(src_token, dst_token));
             } else {
-                let (pair_price, quote, _base) = rpte.get_current_price(src_token, dst_token).unwrap();
+                let prices = rpte.get_current_price(rpte::Route::auto(src_token, dst_token)).unwrap();
+                let (pair_price, quote, _base) = prices.into_iter().next().unwrap_or((Decimal::ZERO, 0, 0));
                 let price = if src_token == quote {
                     pair_price * (Decimal::ONE - price_ratio)
                 } else {
                     pair_price * (Decimal::ONE + price_ratio)
                 };
-                rpte.make(*bot, src_token, dst_token, volume, price);
+                rpte.make(*bot, volume, price, rpte::Route::auto(src_token, dst_token));
             }
         }
     }
@@ -233,15 +234,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 给 USDT-BTC 交易对设手续费，收给 player ──
     use rpte::taker_maker_fee;
     // 先触发自动创建 USDT-BTC 交易对
-    let _ = rpte.get_current_price(usdt_token, btc_token).unwrap();
+    let _ = rpte.get_current_price(rpte::Route::auto(usdt_token, btc_token)).unwrap();
     rpte.step();
     // 找到刚创建的 USDT-BTC 交易对
     let pairs = rpte.get_all_pairs_info();
     for (pid, quote, base, _) in &pairs {
         if *quote == usdt_token && *base == btc_token {
             let fee = taker_maker_fee(
-                Decimal::new(1, 10),  // 万分之0.1 ≈ 0.001%
-                Decimal::ZERO,         // maker 免费
+                Decimal::new(3, 10),  // 万分之0.1 ≈ 0.001%
+                Decimal::new(1, 10),         // maker 免费
                 player,
             );
             rpte.set_pair_fee(*pid, Some(fee)).unwrap();

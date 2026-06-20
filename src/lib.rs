@@ -72,8 +72,10 @@ pub mod contract_presets;
 pub mod tui;
 pub mod fee;
 pub mod fee_presets;
+pub mod route;
 
 pub use rpte::Rpte;
+pub use route::Route;
 pub use fee::FeeCtx;
 pub use fee_presets::empty_fee;
 pub use fee_presets::taker_maker_fee;

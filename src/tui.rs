@@ -362,13 +362,21 @@ fn refresh_caches(engine: &mut Rpte, state: &mut AppState) {
 
     if let View::Kline { src, dst } = state.view {
         state.candle_cache = engine
-            .get_candle_data(src, dst, state.interval)
+            .get_candle_data(crate::Route::auto(src, dst), state.interval)
+            .unwrap_or_default()
+            .into_iter()
+            .next()
             .unwrap_or_default();
         while state.candle_cache.len() > state.max_candles {
             state.candle_cache.pop_front();
         }
-        state.current_price_cache = engine.get_current_price(src, dst).ok();
-        state.live_candle_cache = engine.latest_candle(src, dst, state.interval).ok().flatten();
+        state.current_price_cache = engine.get_current_price(crate::Route::auto(src, dst))
+            .ok()
+            .and_then(|v| v.into_iter().next());
+        state.live_candle_cache = engine.latest_candle(crate::Route::auto(src, dst), state.interval)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .flatten();
     }
 }
 
@@ -1061,7 +1069,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 return;
             }
 
-            engine.make(account_id, src_token, dst_token, volume, price);
+            engine.make(account_id, volume, price, crate::Route::auto(src_token, dst_token));
             state.set_msg(format!(
                 "Limit order placed: account #{} {}→{} vol={} price={}",
                 account_id, parts[1], parts[2], volume, price
@@ -1108,7 +1116,7 @@ fn execute_cmd(cmd: &str, state: &mut AppState, engine: &mut Rpte) {
                 return;
             }
 
-            engine.swap(account_id, src_token, dst_token, volume);
+            engine.swap(account_id, volume, crate::Route::auto(src_token, dst_token));
             state.set_msg(format!(
                 "Market order placed: account #{} {}→{} vol={}",
                 account_id, parts[1], parts[2], volume
