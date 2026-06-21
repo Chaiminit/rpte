@@ -6,7 +6,6 @@
 //! - `Route::on(src, dst, pair_id)`: 指定直连交易对
 //! - `Route::via(src, dst, hops)`: 指定完整多跳路径
 
-use rust_decimal::Decimal;
 
 /// 路由跳：单步兑换路径。
 ///

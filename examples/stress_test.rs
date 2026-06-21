@@ -83,13 +83,6 @@ const PAIRS: &[(&str, &str, f64)] = &[
     ("SOL",  "DOGE", 0.001),    // DOGE/SOL — 多路: USDT→SOL→DOGE vs USDT→DOGE
 ];
 
-/// 多跳路由定义（用于 fast_swap 测试）
-const FAST_ROUTES: &[(&str, &str)] = &[
-    ("USDT", "ETH"),   // 直连 + 经BTC两跳
-    ("USDT", "BTC"),   // 直连 + 经SOL两跳
-    ("USDT", "DOGE"),  // 直连 + 经SOL两跳
-];
-
 // ===================== 随机参数 =====================
 
 fn random_amount(rng: &mut impl Rng, balance: Decimal) -> Decimal {
@@ -122,7 +115,6 @@ struct BotManager {
     step_swap: usize,
     step_make: usize,
     step_cancel: usize,
-    step_fast_swap: usize,
 }
 
 impl BotManager {
@@ -135,7 +127,6 @@ impl BotManager {
             step_swap: 0,
             step_make: 0,
             step_cancel: 0,
-            step_fast_swap: 0,
         }
     }
 
@@ -143,7 +134,6 @@ impl BotManager {
         self.step_swap = 0;
         self.step_make = 0;
         self.step_cancel = 0;
-        self.step_fast_swap = 0;
     }
 
     fn step(&mut self, rpte: &mut Rpte) {
@@ -170,24 +160,6 @@ impl BotManager {
 
             let volume = random_amount(&mut rng, bal);
             if volume.is_zero() { continue; }
-
-            // 10% 概率触发 fast_swap (多跳)
-            let do_fast_swap: bool = rng.gen_range(0.0..=1.0) < 0.10
-                && FAST_ROUTES.iter().any(|(s, d)| {
-                    rpte.get_token_by_name(s) == Some(src_token)
-                    && rpte.get_token_by_name(d) == Some(dst_token)
-                });
-
-            if do_fast_swap {
-                // 用 auto_select_best_route 发现最优路径，然后用 swap 执行
-                match rpte.auto_select_best_route(src_token, dst_token, volume) {
-                    Ok(route) => rpte.swap(bot, volume, route),
-                    Err(_) => rpte.swap(bot, volume, Route::auto(src_token, dst_token)),
-                }
-                self.step_fast_swap += 1;
-                self.step_swap += 1;
-                continue;
-            }
 
             // 50% swap / 50% make
             if rng.gen_bool(0.5) {
@@ -268,7 +240,6 @@ fn main() {
     m.kv_u64("max_steps", max_steps);
     m.kv_usize("token_count", TOKENS.len());
     m.kv_usize("pair_count", PAIRS.len());
-    m.kv_usize("fast_route_count", FAST_ROUTES.len());
     println!("{}", m.build());
 
     run_stress(num_bots, max_steps);
@@ -329,7 +300,6 @@ fn run_stress(num_bots: usize, max_steps: u64) {
     let mut max_step_time_us = 0u64;
     let mut total_swap_count = 0usize;
     let mut total_make_count = 0usize;
-    let mut total_fast_swap_count = 0usize;
     let mut total_vol_usdt = Decimal::ZERO;
     let mut total_vol_base = Decimal::ZERO;
     let mut prev_tra_log_lens: Vec<usize> = vec![0; PAIRS.len()];
@@ -415,8 +385,7 @@ fn run_stress(num_bots: usize, max_steps: u64) {
 
         total_swap_count += mgr.step_swap;
         total_make_count += mgr.step_make;
-        total_fast_swap_count += mgr.step_fast_swap;
-
+    
         // 异常检测
         anomaly.check(step, price, ob1_buy.price, ob1_sell.price);
 
@@ -437,7 +406,6 @@ fn run_stress(num_bots: usize, max_steps: u64) {
         j.kv_usize("step_swap", mgr.step_swap);
         j.kv_usize("step_make", mgr.step_make);
         j.kv_usize("step_cancel", mgr.step_cancel);
-        j.kv_usize("step_fast_swap", mgr.step_fast_swap);
         j.kv_u64("step_time_us", elapsed_us);
         println!("{}", j.build());
 
@@ -464,7 +432,6 @@ fn run_stress(num_bots: usize, max_steps: u64) {
     s.kv_usize("spread_blowout_count", anomaly.spread_blowout_steps.len());
     s.kv_usize("total_make_count", total_make_count);
     s.kv_usize("total_swap_count", total_swap_count);
-    s.kv_usize("total_fast_swap_count", total_fast_swap_count);
     s.kv_f64("total_vol_usdt", decimal_to_f64(total_vol_usdt));
     s.kv_f64("total_vol_base", decimal_to_f64(total_vol_base));
     // 收集最终权益数据
