@@ -12,7 +12,7 @@ use crate::contract::Contract;
 use std::mem::take;
 use crate::order::{Order, OrderBrief, OrderType};
 use crate::pair::{TraLog, CandleData};
-use crate::route::Route;
+use crate::route::{Route, RouteHop};
 
 
 pub struct Rpte {
@@ -614,6 +614,8 @@ impl Rpte {
             volume,
             price,
             pair_id: route.pair_id,
+            route: Some(route.clone()),
+            current_hop: 0,
         });
     }
 
@@ -627,6 +629,8 @@ impl Rpte {
             dst_token: route.dst_token,
             volume,
             pair_id: route.pair_id,
+            route: Some(route),
+            current_hop: 0,
         });
     }
 
@@ -730,6 +734,139 @@ impl Rpte {
         // Auto: 查找或自动创建
         let (pair_id, is_forward) = self.get_or_create_pair(src, dst)?;
         Ok(vec![(pair_id, is_forward)])
+    }
+
+    /// 发现所有可能的交易路径（路由）在 src_token ↔ dst_token 之间。
+    /// 按优先级返回：直连 → 经全局 quote token → 经任意中间 token。
+    /// 返回空 Vec 表示无可用路径。
+    pub fn route_discover(&mut self, src_token: usize, dst_token: usize) -> Vec<Route> {
+        if src_token == dst_token {
+            return vec![];
+        }
+        let mut routes: Vec<Route> = Vec::new();
+        let quote = self.global_quote_token;
+        let pairs = self.get_all_pairs_info();
+
+        // 辅助：检查是否存在 (q, b) 交易对
+        let has_pair = |q: usize, b: usize| -> bool {
+            pairs.iter().any(|&(_, pq, pb, _)| (pq == q && pb == b) || (pq == b && pb == q))
+        };
+
+        // 1. 直连路径
+        if has_pair(src_token, dst_token) {
+            routes.push(Route::auto(src_token, dst_token));
+        }
+
+        // 2. 经全局 quote token 的 2 跳路径：src→quote→dst
+        if src_token != quote && dst_token != quote {
+            if has_pair(src_token, quote) && has_pair(quote, dst_token) {
+                let hops = vec![
+                    RouteHop { pair_id: 0, src_token, dst_token: quote },
+                    RouteHop { pair_id: 0, dst_token, src_token: quote },
+                ];
+                routes.push(Route::via(src_token, dst_token, hops));
+            }
+        }
+
+        // 3. 经任意中间 token 的 2 跳路径：src→mid→dst（mid ≠ quote）
+        let all_tokens: Vec<usize> = self.token_id_to_name.keys().copied().collect();
+        for &mid in &all_tokens {
+            if mid == src_token || mid == dst_token || mid == quote {
+                continue;
+            }
+            if has_pair(src_token, mid) && has_pair(mid, dst_token) {
+                // 避免重复（已有相同的推）
+                let already = routes.iter().any(|r| {
+                    r.hops.len() == 2
+                        && r.hops[0].dst_token == mid
+                        && r.hops[1].src_token == mid
+                });
+                if !already {
+                    let hops = vec![
+                        RouteHop { pair_id: 0, src_token, dst_token: mid },
+                        RouteHop { pair_id: 0, src_token: mid, dst_token },
+                    ];
+                    routes.push(Route::via(src_token, dst_token, hops));
+                }
+            }
+        }
+
+        routes
+    }
+
+    /// 沿指定 Route 换算 amount 经过各跳后的净得数量。
+    /// 对于每跳，通过交易对当前价格换算。若路径无效返回 Decimal::ZERO。
+    pub fn convert_value_via(&mut self, route: &Route, amount: Decimal) -> Decimal {
+        if amount.is_zero() {
+            return Decimal::ZERO;
+        }
+        let pairs = self.get_all_pairs_info();
+
+        // 单跳换算辅助
+        let convert_one = |pairs: &[(usize, usize, usize, Decimal)], src: usize, dst: usize, amt: Decimal| -> Option<Decimal> {
+            for &(_, q, b, price) in pairs {
+                if price.is_zero() {
+                    continue;
+                }
+                if q == src && b == dst {
+                    return Some(self.round(amt / price));
+                }
+                if q == dst && b == src {
+                    return Some(self.round(amt * price));
+                }
+            }
+            None
+        };
+
+        if let Some(_pid) = route.pair_id {
+            // 直连路径（单跳）
+            return convert_one(&pairs, route.src_token, route.dst_token, amount).unwrap_or(Decimal::ZERO);
+        }
+
+        if route.hops.is_empty() {
+            // 未解析的路由：使用自动换算
+            return self.convert_value(route.src_token, route.dst_token, amount);
+        }
+
+        // 多跳路径：逐跳换算
+        let mut current = amount;
+        let mut prev_token = route.src_token;
+        for hop in &route.hops {
+            if hop.src_token != prev_token {
+                return Decimal::ZERO;
+            }
+            match convert_one(&pairs, hop.src_token, hop.dst_token, current) {
+                Some(v) => current = v,
+                None => return Decimal::ZERO,
+            }
+            prev_token = hop.dst_token;
+        }
+        if prev_token != route.dst_token {
+            return Decimal::ZERO;
+        }
+        current
+    }
+
+    /// 对于 Route::auto，自动发现并选择最佳路由（净得最多 dst_token）。
+    /// 对 route_discover 发现的每条路径，调用 convert_value_via 估算实际兑出量，选最优。
+    pub fn auto_select_best_route(&mut self, src_token: usize, dst_token: usize, amount: Decimal) -> Result<Route> {
+        let candidates = self.route_discover(src_token, dst_token);
+        if candidates.is_empty() {
+            return Err(Error::SwapNotAllowed { src: src_token, dst: dst_token });
+        }
+
+        let mut best_route = candidates[0].clone();
+        let mut best_amount = self.convert_value_via(&best_route, amount);
+
+        for r in &candidates[1..] {
+            let conv = self.convert_value_via(r, amount);
+            if conv > best_amount {
+                best_amount = conv;
+                best_route = r.clone();
+            }
+        }
+
+        Ok(best_route)
     }
 
     /// 解析 Route 并返回 pair_id。指定 pair_id 则验证，否则 auto 创建/选择。
@@ -893,7 +1030,7 @@ impl Rpte {
             return Err(Error::OrderNotRegistered(order_id));
         }
 
-        let (pair_id, src_token, dst_token, price, step_count_created, src_volume, dst_volume) = {
+        let (pair_id, src_token, dst_token, price, step_count_created, src_volume, dst_volume, route, current_hop) = {
             let order = self.get_order_node(order_id)?;
             let src = order.get_src_token();
             let dst = order.get_dst_token();
@@ -902,7 +1039,9 @@ impl Rpte {
             let pair = order.get_pair_node_id();
             let sv = order.balance(src);
             let dv = order.balance(dst);
-            (pair, src, dst, price, step, sv, dv)
+            let rt = order.get_route().cloned();
+            let ch = order.get_current_hop();
+            (pair, src, dst, price, step, sv, dv, rt, ch)
         };
 
         let drt = {
@@ -923,6 +1062,8 @@ impl Rpte {
             dst_volume,
             price,
             step_count_created,
+            route,
+            current_hop,
         })
     }
 
@@ -1223,7 +1364,7 @@ impl Rpte {
             }
 
             // === 3. 处理所有开单/市价单/创建合约（CallContract 除外） ===
-            let mut swap_groups: HashMap<(usize, Drt), Vec<(usize, Decimal)>> = HashMap::new();
+            let mut swap_groups: HashMap<(usize, Drt), Vec<(usize, Decimal, Option<Route>, usize)>> = HashMap::new();
             let mut call_contract_msgs: Vec<Msg> = Vec::new();
             for msg in remaining {
                 match msg {
@@ -1274,7 +1415,7 @@ impl Rpte {
                             }
                         }
                     }
-                    Msg::SwapOrder { src_id: _, owner_node_id, src_token, dst_token, volume, .. } => {
+                    Msg::SwapOrder { src_id: _, owner_node_id, src_token, dst_token, volume, route, current_hop, .. } => {
                         let (pair_node_id, _) = match self.get_or_create_pair(src_token, dst_token) {
                             Ok(v) => v,
                             Err(e) => {
@@ -1316,7 +1457,34 @@ impl Rpte {
                         swap_groups
                             .entry((pair_node_id, direction))
                             .or_default()
-                            .push((owner_node_id, volume));
+                            .push((owner_node_id, volume, route, current_hop));
+                    }
+                    Msg::FastSwap { src_id, route, volume, current_hop } => {
+                        // 处理 FastSwap：逐跳处理
+                        if current_hop >= route.hops.len() {
+                            continue;
+                        }
+                        let hop = &route.hops[current_hop];
+                        // 推送该跳的 SwapOrder
+                        all_msgs.push(Msg::SwapOrder {
+                            src_id,
+                            owner_node_id: src_id,
+                            src_token: hop.src_token,
+                            dst_token: hop.dst_token,
+                            volume,
+                            pair_id: Some(hop.pair_id),
+                            route: Some(route.clone()),
+                            current_hop,
+                        });
+                        // 若还有后续跳，推送下一个 FastSwap
+                        if current_hop + 1 < route.hops.len() {
+                            all_msgs.push(Msg::FastSwap {
+                                src_id,
+                                route: route.clone(),
+                                volume,
+                                current_hop: current_hop + 1,
+                            });
+                        }
                     }
                     Msg::CreateContract { owner_node_id, name, on_create, on_update, on_end, on_called } => {
                         let step = self.step_count;
@@ -1378,9 +1546,9 @@ impl Rpte {
             }
 
             // === 3c. 批量处理按比例分配的市价单 ===
-            for ((pair_node_id, direction), swaps) in swap_groups {
+            for ((pair_node_id, direction), mut swaps) in swap_groups {
                 if swaps.len() == 1 {
-                    let (owner_id, volume) = swaps[0];
+                    let (owner_id, volume, route, current_hop) = swaps.swap_remove(0);
                     let (transfers, close_ids) = {
                         let self_ptr: *const Self = self;
                         let pair = self.nodes[pair_node_id].as_pair_node()
@@ -1390,7 +1558,7 @@ impl Rpte {
                         pair.process_swap(owner_id, direction, volume, reader)
                     };
 
-                    for t in transfers {
+                    for t in &transfers {
                         if let Err(e) = self._transfer(t.src_id, t.dst_id, t.token, t.volume) {
                             eprintln!("WARNING: Swap transfer failed: {e}");
                         }
@@ -1401,6 +1569,31 @@ impl Rpte {
                     for order_id in close_ids {
                         self.msgs.push(Msg::CloseOrder { order_id });
                     }
+
+                    // 路由转发：如果该 swap 有 route 且还有后续跳，使用实际收到的 dst_token 数量继续
+                    if let Some(ref route) = route {
+                        let next_hop = current_hop + 1;
+                        if next_hop < route.hops.len() {
+                            // 从 transfers 中找出 owner 实际收到的 dst_token 数量
+                            let actual_received: Decimal = transfers.iter()
+                                .filter(|t| t.dst_id == owner_id && t.token == route.dst_token)
+                                .map(|t| t.volume)
+                                .sum();
+                            if !actual_received.is_zero() {
+                                let next_hop = &route.hops[next_hop];
+                                self.msgs.push(Msg::SwapOrder {
+                                    src_id: owner_id,
+                                    owner_node_id: owner_id,
+                                    src_token: next_hop.src_token,
+                                    dst_token: next_hop.dst_token,
+                                    volume: actual_received,
+                                    pair_id: Some(next_hop.pair_id),
+                                    route: Some(route.clone()),
+                                    current_hop: current_hop + 1,
+                                });
+                            }
+                        }
+                    }
                 } else {
                     let (transfers, close_ids) = {
                         let self_ptr: *const Self = self;
@@ -1408,10 +1601,13 @@ impl Rpte {
                             .expect("pair_node_id not a PairNode");
                         // SAFETY: EngineReader only reads non-nodes fields
                         let reader: &dyn EngineReader = unsafe { &*self_ptr };
-                        pair.process_swaps_batch(direction, &swaps, reader)
+                        let simple_swaps: Vec<(usize, Decimal)> = swaps.iter()
+                            .map(|&(id, vol, _, _)| (id, vol))
+                            .collect();
+                        pair.process_swaps_batch(direction, &simple_swaps, reader)
                     };
 
-                    for t in transfers {
+                    for t in &transfers {
                         if let Err(e) = self._transfer(t.src_id, t.dst_id, t.token, t.volume) {
                             eprintln!("WARNING: Swap transfer failed: {e}");
                         }

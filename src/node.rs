@@ -6,6 +6,7 @@ use rust_decimal::Decimal;
 use crate::order::{OrderBrief, OrderType};
 use crate::pair::{TraLog, CandleData};
 use crate::fee::FeeFn;
+use crate::route::Route;
 
 /// Token 交换检查闭包：(EngineReader, self_token, other_token, src_node, dst_node) → 是否允许
 pub type SwapCheckFn = Arc<dyn Fn(&dyn EngineReader, usize, usize, usize, usize) -> bool + Send + Sync>;
@@ -89,7 +90,32 @@ pub trait OrderNode: Node {
     fn get_price(&self) -> &Decimal;
     fn get_step_count_created(&self) -> u64;
     fn get_order_type(&self) -> &OrderType;
-    fn open(&mut self, owner_node_id: usize, pair_node_id: usize, src_token: usize, dst_token: usize, price: Decimal, step_count_created: u64, order_type: OrderType) -> bool;
+    fn get_route(&self) -> Option<&Route> { None }
+    fn get_current_hop(&self) -> usize { 0 }
+    fn open(
+        &mut self,
+        owner_node_id: usize,
+        pair_node_id: usize,
+        src_token: usize,
+        dst_token: usize,
+        price: Decimal,
+        step_count_created: u64,
+        order_type: OrderType,
+    ) -> bool;
+    fn open_with_route(
+        &mut self,
+        owner_node_id: usize,
+        pair_node_id: usize,
+        src_token: usize,
+        dst_token: usize,
+        price: Decimal,
+        step_count_created: u64,
+        order_type: OrderType,
+        route: Option<Route>,
+        current_hop: usize,
+    ) -> bool {
+        self.open(owner_node_id, pair_node_id, src_token, dst_token, price, step_count_created, order_type)
+    }
     fn close(&mut self);
     fn is_open(&self) -> bool;
 }
@@ -244,6 +270,8 @@ pub enum Msg {
         volume: Decimal,
         price: Decimal,
         pair_id: Option<usize>,
+        route: Option<Route>,
+        current_hop: usize,
     },
     SwapOrder {
         src_id: usize,
@@ -252,6 +280,8 @@ pub enum Msg {
         dst_token: usize,
         volume: Decimal,
         pair_id: Option<usize>,
+        route: Option<Route>,
+        current_hop: usize,
     },
     CloseOrder {
         order_id: usize,
@@ -296,5 +326,13 @@ pub enum Msg {
     SetPairFee {
         pair_id: usize,
         fee_fn: Option<FeeFn>,
+    },
+    /// 快速兑换：按发现的路由逐跳自动兑换
+    FastSwap {
+        src_id: usize,
+        route: Route,
+        volume: Decimal,
+        /// 当前正在处理的跳数
+        current_hop: usize,
     },
 }
