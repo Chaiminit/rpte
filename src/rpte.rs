@@ -1154,8 +1154,13 @@ impl Rpte {
         {
             let vp_ids: Vec<usize> = self.registered_virtual_pairs.iter().copied().collect();
             for vp_id in vp_ids {
-                if let Some(vp) = self.nodes.get_mut(vp_id).and_then(|n| n.as_pair_node()) {
+                let self_ptr: *const Self = self;
+                let vp = self.nodes.get_mut(vp_id).and_then(|n| n.as_pair_node());
+                if let Some(vp) = vp {
                     vp.update(self.step_count);
+                    // SAFETY: EngineReader only reads non-nodes fields (precision, step_count, etc.)
+                    let reader: &dyn EngineReader = unsafe { &*self_ptr };
+                    vp.match_orders(reader);
                 }
             }
         }
