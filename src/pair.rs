@@ -545,7 +545,7 @@ impl PairNode for Pair {
         let n = swaps.len();
         let mut remain: Vec<Decimal> = swaps.iter().map(|(_, v)| *v).collect();
 
-        let mut batch_guard = 500;
+        let mut batch_guard = 5000;
         loop {
             let total_remain: Decimal = remain.iter().sum();
             if total_remain <= eps { break; }

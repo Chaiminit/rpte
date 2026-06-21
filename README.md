@@ -8,8 +8,14 @@ RPTE is a **node-based** perpetual contract trading simulation engine written in
 - **Multi-account management** — Multiple independent accounts, each holding its own assets
 - **Limit orders (Make)** — Price-time priority order book matching
 - **Market orders (Swap)** — Instant execution at the best available order book price
+- **Batch market orders** — Proportional allocation across multiple swappers in one frame
 - **Order book management** — Built on `BTreeMap`, O(log n) insert/delete/lookup
 - **Candle aggregation** — Candle data generation for arbitrary time intervals
+- **Route routing** — `Route::auto` / `Route::on` for selecting specific trading pairs; `route_discover` for multi-hop path finding
+- **Fee system** — Configurable taker/maker fee closures attached to any trading pair
+- **Contract system** — Deploy custom on-chain logic (on_create / on_update / on_end / on_called)
+- **Virtual trading pairs** — Contract-backed pairs with dynamic pricing
+- **Built-in DeFi presets** — Lending market with cross-collateralization, liquidation, and dynamic interest rates
 - **Message-driven** — Nodes communicate via messages, engine runs on frame-driven ticks
 - **Frame sync control** — Supports fixed frame rate or single-step execution
 
@@ -24,9 +30,12 @@ RPTE is a **node-based** perpetual contract trading simulation engine written in
 │  │  Token   │  │ Account  │  │  Order   │          │
 │  └──────────┘  └──────────┘  └──────────┘          │
 │  ┌────────────────────────────────────────┐         │
-│  │           Pair (Trading Pair)           │         │
+│  │        Pair / VirtualPair              │         │
 │  │  ┌───────────────┐  ┌───────────────┐  │         │
 │  │  │   OrderBook   │  │   TradeLogs   │  │         │
+│  └────────────────────────────────────────┘         │
+│  ┌────────────────────────────────────────┐         │
+│  │           Contract (Master/Slave)      │         │
 │  └────────────────────────────────────────┘         │
 └─────────────────────────────────────────────────────┘
 ```
@@ -39,7 +48,7 @@ All nodes are stored in a `Vec<Box<dyn Node>>` and communicate via **messages (M
 
 ```rust
 use rust_decimal::Decimal;
-use rpte::Rpte;
+use rpte::{Rpte, Route};
 
 let mut engine = Rpte::new("USDT", 4);
 ```
@@ -63,11 +72,11 @@ engine.issue(alice, btc, Decimal::new(10, 0)).unwrap();
 
 ```rust
 // Limit buy order: Buy BTC at 50000 USDT/BTC
-engine.make(alice, usdt, btc, Decimal::new(5000, 0), Decimal::new(50000, 0));
+engine.make(alice, Decimal::new(5000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
 engine.step();
 
 // Market sell order: Sell 0.1 BTC at market price
-engine.swap(alice, btc, usdt, Decimal::new(1, 1));
+engine.swap(alice, Decimal::new(1, 1), Route::auto(btc, usdt));
 engine.step();
 ```
 
@@ -78,17 +87,65 @@ engine.step();
 let balance = engine.get_node_balance(alice, usdt).unwrap();
 println!("Alice USDT balance: {balance}");
 
-// Query price with orientation info
-let (price, quote, base) = engine.get_current_price(usdt, btc).unwrap();
+// Query price — returns Vec of matching pairs
+let prices = engine.get_current_price(Route::auto(usdt, btc)).unwrap();
+let (price, quote, base) = prices[0];
 println!("1 {base} = {price} {quote}");
 
-// Query order book depth — direction auto-derived from src/dst tokens
-let depth = engine.get_order_book(usdt, btc, 0).unwrap();
-println!("Best price: {}, volume: {}", depth.price, depth.volume);
+// Query order book depth
+let depths = engine.get_order_book(Route::auto(usdt, btc), 0).unwrap();
+println!("Best price: {}, volume: {}", depths[0].price, depths[0].volume);
 
 // Get latest candle
-let candle = engine.latest_candle(usdt, btc, 10).unwrap();
-println!("Latest candle: {candle:?}");
+let candles = engine.latest_candle(Route::auto(usdt, btc), 10).unwrap();
+if let Some(candle) = candles[0] {
+    println!("Latest candle: {candle:?}");
+}
+```
+
+### Discover Routes
+
+```rust
+// Find multi-hop path: src_token → dst_token
+let hops = engine.route_discover(usdt, btc);
+for hop in &hops {
+    let src_name = engine.get_token_name(hop.src_token).unwrap_or("?");
+    let dst_name = engine.get_token_name(hop.dst_token).unwrap_or("?");
+    println!("pair {}: {} → {}", hop.pair_id, src_name, dst_name);
+}
+```
+
+### Set Trading Fees
+
+```rust
+use rpte::{taker_maker_fee, FeeCtx};
+use std::sync::Arc;
+
+// Use the built-in preset
+let fee = taker_maker_fee(
+    Decimal::new(3, 4),    // 0.03% taker
+    Decimal::new(1, 4),    // 0.01% maker
+    fee_collector,
+);
+engine.set_pair_fee(pair_id, Some(fee)).unwrap();
+```
+
+### Deploy a Lending Contract
+
+```rust
+use rpte::LendingPreset;
+
+let lending = LendingPreset::new_bidirectional(
+    usdt, btc,
+    "aUSDT", "aBTC",
+    "dUSDT", "dBTC",
+    Decimal::new(130, 2),  // min_collateral_ratio = 1.30
+    Decimal::new(110, 2),  // liquidation_threshold = 1.10
+);
+let (on_create, on_update, on_end, on_called_fns) = lending.build();
+engine.deploy(player, "USDT/BTC Lending", on_create, on_update, on_end, on_called_fns);
+engine.step();
+engine.step();
 ```
 
 ## Running Modes
@@ -100,50 +157,39 @@ RPTE supports two running modes:
 | Single-step | `step()` | Manually drive one frame, suitable for testing and precise control |
 | Fixed frame rate | `run(fps)` | Continuously run at a specified frame rate until `stop()` is called |
 
-## API Overview
+## Modules
 
-### Engine Operations (`Rpte`)
-
-| Method | Description |
+| Module | Description |
 |--------|-------------|
-| `new(quote, precision)` | Create a new engine with the specified quote token and precision |
-| `register_token(name)` | Register a token, returns token ID |
-| `register_account()` | Register an account, returns account ID |
-| `issue(node, token, volume)` | Issue assets to a specified node |
-| `make(src, src_token, dst_token, volume, price)` | Create a limit order |
-| `swap(src, src_token, dst_token, volume)` | Create a market order |
-| `cancel(order_id)` | Cancel an order |
-| `transfer(src, dst, token, volume)` | Transfer assets (strict: fails if balance insufficient) |
-| `transfer_with_overdraft(src, dst, token, volume)` | Transfer assets (allows negative balance) |
-| `step()` | Drive one frame |
-| `run(fps)` | Run at a fixed frame rate (`fps` must be > 0) |
-| `stop()` | Stop running |
+| `rpte` | Engine core, exposes all operational interfaces |
+| `node` | Core trait definitions: `Node`, `PairNode`, `OrderNode`, `AccountNode`, etc. |
+| `token` | Token node implementation |
+| `account` | Account node implementation |
+| `order` | Order node implementation |
+| `pair` | Trading pair node, order book, candle aggregation |
+| `virtual_pair` | Contract-backed virtual trading pair |
+| `contract` | State-machine contract with lifecycle hooks |
+| `route` | Route routing (`Route`, `RouteHop`) |
+| `fee` | Fee system (`FeeFn`, `FeeCtx`) |
+| `fee_presets` | Pre-built fee strategies (`taker_maker_fee`) |
+| `contract_presets` | Pre-built contract templates (`LendingPreset`) |
+| `order_book` | BTreeMap-based order book |
+| `tui` | Terminal UI (ratatui-based) |
 
-### Query Methods
+## Key Types
 
-| Method | Return Type | Description |
-|--------|-------------|-------------|
-| `get_node_balance(node, token)` | `Result<Decimal>` | Query node balance |
-| `get_current_price(src, dst)` | `Result<(Decimal, usize, usize)>` | Get current price as `(price, quote_token, base_token)`, meaning 1 base_token = price quote_token |
-| `get_order_book(src, dst, depth)` | `Result<OrderBookDepth>` | Get order book depth at the specified level. Direction (Buy/Sell) is auto-derived from src/dst tokens |
-| `get_all_orders()` | `Vec<usize>` | List all open order IDs |
-| `get_all_tokens()` | `Vec<usize>` | List all registered token IDs |
-| `get_all_accounts()` | `Vec<usize>` | List all registered account IDs |
-| `get_all_pairs()` | `Vec<usize>` | List all registered pair IDs |
-| `get_tra_logs(src, dst)` | `Result<VecDeque<TraLog>>` | Get trade logs for a trading pair |
-| `get_candle_data(src, dst, interval)` | `Result<VecDeque<CandleData>>` | Get candle (OHLCV) data for a trading pair |
-| `latest_candle(src, dst, interval)` | `Result<Option<CandleData>>` | Get the latest candle for a trading pair |
+| Type | Description |
+|------|-------------|
+| `Route` | Trading route: src_token, dst_token, optional pair_id |
+| `RouteHop` | A single hop in a discovered route path |
+| `FeeCtx` | Fee invocation context (tokens, volumes, taker/maker) |
+| `FeeFn` | Configurable fee closure |
+| `OrderBookDepth` | A single level in the order book |
+| `TraLog` | A single trade log entry |
+| `CandleData` | OHLCV candle data |
+| `OrderBrief` | Summary of an active order |
 
-### Key Types
-
-| Type | Fields | Description |
-|------|--------|-------------|
-| `OrderBookDepth` | `price: Decimal`, `volume: Decimal` | A single level in the order book |
-| `TraLog` | `step_count`, `price`, `volume`, ... | A single trade log entry |
-| `CandleData` | `step_count`, `open`, `high`, `low`, `close`, `volume` | OHLCV candle data |
-| `OrderBrief` | `id`, `direction`, `src_token`, `dst_token`, `src_volume`, `dst_volume`, `price`, `step_count_created` | A summary of an active order |
-
-### Error Handling
+## Error Handling
 
 All fallible operations return `Result<T>`, with the error type `Error` including:
 
@@ -151,9 +197,19 @@ All fallible operations return `Result<T>`, with the error type `Error` includin
 |---------------|-------------|
 | `NodeNotFound` | Node ID out of range |
 | `TokenNotRegistered` | Token not registered |
-| `InsufficientBalance` | Insufficient balance (raised by strict `transfer` and internal checks) |
+| `InsufficientBalance` | Insufficient balance |
 | `OrderNotRegistered` | Order not registered |
-| `NotAPairNode` / `NotAnOrderNode` / `NotAnAccountNode` | Node type mismatch |
+| `PairNotFound` | Pair ID not found |
+| `NoRouteFound` | No conversion route between two tokens |
+| `SwapNotAllowed` | Token swap blacklisted by whitelist closure |
+| `NotAPairNode` / `NotAnOrderNode` / etc. | Node type mismatch |
+
+## Examples
+
+```bash
+cargo run --example simswap      # Lending market simulation with random bots
+cargo run --example stress_test  # Stress test with many orders
+```
 
 ## License
 

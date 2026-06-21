@@ -569,7 +569,7 @@ impl Rpte {
 
     /// 获取订单簿深度。
     /// `route` 指定源/目标代币及可选的交易对。
-    /// 返回 Vec<OrderBookDepth>（若 route.pair_id = None，每个交易对一个 OrderBookDepth）。
+    /// 返回 `Vec<OrderBookDepth>`（若 route.pair_id = None，每个交易对一个 OrderBookDepth）。
     pub fn get_order_book(&mut self, route: Route, depth: usize) -> Result<Vec<OrderBookDepth>> {
         let pairs = self.resolve_pairs(&route)?;
         let mut results = Vec::new();
@@ -1075,7 +1075,7 @@ impl Rpte {
 
     /// 获取成交记录。
     /// 若 route.pair_id = Some(pid)：返回单条 VecDeque
-    /// 若 route.pair_id = None：遍历所有匹配交易对，返回全部 Vec<VecDeque<TraLog>>
+    /// 若 route.pair_id = None：遍历所有匹配交易对，返回全部 `Vec<VecDeque<TraLog>>`
     pub fn get_tra_logs(&mut self, route: Route) -> Result<Vec<VecDeque<TraLog>>> {
         let pairs = self.resolve_pairs(&route)?;
         let mut results = Vec::new();
