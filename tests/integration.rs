@@ -953,3 +953,58 @@ fn test_swap_insufficient_balance_not_crash() {
     assert!(usdt_bal == Decimal::ZERO || usdt_bal == Decimal::new(10, 0),
         "bot should have 0 or 10 USDT left (only 10 issued), got {}", usdt_bal);
 }
+
+// ============================
+// 多跳路由测试
+// ============================
+
+#[test]
+fn test_multi_hop_swap_via_quote() {
+    // 测试无直接交易对时，通过 USDT 中转完成 BTC→ETH 兑换
+    // 只有 USDT↔BTC 和 USDT↔ETH 两个交易对，无 BTC↔ETH
+    let mut engine = Rpte::new("USDT", 5);
+    let usdt = engine.get_token_by_name("USDT").unwrap();
+    let btc = engine.register_token("BTC");
+    let eth = engine.register_token("ETH");
+
+    // maker1: 买入 BTC（花 USDT，收 BTC）
+    let maker1 = engine.register_account();
+    engine.issue(maker1, usdt, Decimal::new(500_000, 0)).unwrap();
+    engine.make(maker1, Decimal::new(500_000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
+    engine.step(); // 处理开单
+    engine.step(); // 触发交易对创建 + 开单
+
+    // maker2: 卖出 ETH（花 ETH，收 USDT）
+    let maker2 = engine.register_account();
+    engine.issue(maker2, eth, Decimal::new(200, 0)).unwrap();
+    engine.make(maker2, Decimal::new(200, 0), Decimal::new(3000, 0), Route::auto(eth, usdt));
+    engine.step(); // 处理开单
+    engine.step();
+
+    // 验证两个交易对都存在且无直接 BTC↔ETH 对
+    let pairs = engine.get_all_pairs_info();
+    let has_btc_eth = pairs.iter().any(|(_, q, b, _)| {
+        (*q == btc && *b == eth) || (*q == eth && *b == btc)
+    });
+    assert!(!has_btc_eth, "there should be NO direct BTC-ETH pair");
+
+    // bot: 持有 BTC，想换成 ETH，需要通过 USDT 中转
+    let bot = engine.register_account();
+    engine.issue(bot, btc, Decimal::new(1, 0)).unwrap();
+
+    // 使用 Route::auto，引擎应自动发现 BTC→USDT→ETH 路径
+    engine.swap(bot, Decimal::new(1, 0), Route::auto(btc, eth));
+    engine.step(); // 第一帧：处理 SwapOrder → BTC→USDT
+    engine.step(); // 第二帧：转发 SwapOrder → USDT→ETH
+    engine.step(); // 第三帧：处理最后一跳
+
+    // bot 的 BTC 应该减少了
+    let bot_btc = engine.get_node_balance(bot, btc).unwrap();
+    assert!(bot_btc < Decimal::new(1, 0), "bot should have spent BTC, got {}", bot_btc);
+
+    // bot 应该收到了 ETH
+    let bot_eth = engine.get_node_balance(bot, eth).unwrap();
+    assert!(bot_eth > Decimal::ZERO, "bot should have received ETH, got {}", bot_eth);
+
+    // maker 也得到了成交（余额会相应变化）
+}

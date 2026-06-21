@@ -1422,7 +1422,17 @@ impl Rpte {
                         }
                     }
                     Msg::SwapOrder { src_id: _, owner_node_id, src_token, dst_token, volume, route, current_hop, .. } => {
-                        let (pair_node_id, _) = match self.get_or_create_pair(src_token, dst_token) {
+                        // 多跳路由：使用当前跳的 src/dst token，而非全局路由的
+                        let (hop_src, hop_dst) = if let Some(ref rt) = route {
+                            if current_hop < rt.hops.len() {
+                                (rt.hops[current_hop].src_token, rt.hops[current_hop].dst_token)
+                            } else {
+                                (src_token, dst_token)
+                            }
+                        } else {
+                            (src_token, dst_token)
+                        };
+                        let (pair_node_id, _) = match self.get_or_create_pair(hop_src, hop_dst) {
                             Ok(v) => v,
                             Err(e) => {
                                 eprintln!("WARNING: SwapOrder skipped: {e}");
@@ -1431,14 +1441,14 @@ impl Rpte {
                         };
 
                         // 检查余额（可为负的代币不受余额限制）
-                        let balance = match self.get_node_balance(owner_node_id, src_token) {
+                        let balance = match self.get_node_balance(owner_node_id, hop_src) {
                             Ok(b) => b,
                             Err(e) => {
                                 eprintln!("ERROR: SwapOrder balance check failed: {e}");
                                 continue;
                             }
                         };
-                        let can_neg = self.get_token_can_be_negative(src_token);
+                        let can_neg = self.get_token_can_be_negative(hop_src);
                         let volume = if can_neg { volume } else { volume.min(balance) };
                         if volume.is_zero() {
                             continue;
@@ -1453,7 +1463,7 @@ impl Rpte {
                                     continue;
                                 }
                             };
-                            if pair.get_quote_token() == src_token && pair.get_base_token() == dst_token {
+                            if pair.get_quote_token() == hop_src && pair.get_base_token() == hop_dst {
                                 Drt::Buy
                             } else {
                                 Drt::Sell
@@ -1553,9 +1563,10 @@ impl Rpte {
                     if let Some(ref route) = route {
                         let next_hop = current_hop + 1;
                         if next_hop < route.hops.len() {
-                            // 从 transfers 中找出 owner 实际收到的 dst_token 数量
+                            // 从 transfers 中找出 owner 实际收到的当前跳 dst_token 数量
+                            let hop_dst = route.hops[current_hop].dst_token;
                             let actual_received: Decimal = transfers.iter()
-                                .filter(|t| t.dst_id == owner_id && t.token == route.dst_token)
+                                .filter(|t| t.dst_id == owner_id && t.token == hop_dst)
                                 .map(|t| t.volume)
                                 .sum();
                             if !actual_received.is_zero() {
