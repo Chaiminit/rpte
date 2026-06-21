@@ -1,6 +1,6 @@
 [package]
 name = "rpte"
-version = "0.0.1"
+version = "0.0.1-alpha.1"
 edition = "2024"
 description = "Rust Perpetual Trading Engine — A node-based perpetual trading simulation engine"
 keywords = ["trading", "engine", "perpetual", "simulation", "order-book"]
