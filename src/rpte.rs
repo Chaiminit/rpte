@@ -281,6 +281,11 @@ impl Rpte {
         self.precision
     }
 
+    /// 当前步数
+    pub fn get_step_count(&self) -> u64 {
+        self.step_count
+    }
+
     /// 处理一帧消息，供外部手动驱动
     pub fn step(&mut self) {
         self.update();
@@ -487,7 +492,8 @@ impl Rpte {
     }
 
     pub fn get_all_orders(&self) -> Vec<usize> {
-        self.registered_orders.iter()
+        self.registered_orders
+            .iter()
             .filter(|&&id| id < self.nodes.len() && self.nodes[id].is_open())
             .copied()
             .collect()
@@ -495,12 +501,33 @@ impl Rpte {
 
     pub fn get_node_balance(&mut self, id: usize, token: usize) -> Result<Decimal> {
         if id >= self.nodes.len() {
-            return Err(Error::NodeNotFound { id, len: self.nodes.len() });
+            return Err(Error::NodeNotFound {
+                id,
+                len: self.nodes.len(),
+            });
         }
         if !self.token_id_to_name.contains_key(&token) {
             return Err(Error::TokenNotRegistered(token));
         }
         Ok(self.nodes[id].balance(token))
+    }
+
+    /// 获取账户所有 token 的余额
+    pub fn get_account_balance_all(
+        &mut self,
+        account_id: usize,
+    ) -> Result<HashMap<usize, Decimal>> {
+        if !self.registered_accounts.contains(&account_id) {
+            return Err(Error::NodeNotFound {
+                id: account_id,
+                len: self.nodes.len(),
+            });
+        }
+        let mut result = HashMap::new();
+        for &token in self.token_id_to_name.keys() {
+            result.insert(token, self.nodes[account_id].balance(token));
+        }
+        Ok(result)
     }
 
     /// 获取账户的完整权益 sheet（账户自身余额 + 所有挂单余额，按 token 汇总）。
