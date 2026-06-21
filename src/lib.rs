@@ -14,7 +14,7 @@
 //!
 //! ```rust
 //! use rust_decimal::Decimal;
-//! use rpte::Rpte;
+//! use rpte::{Rpte, Route};
 //!
 //! // Create an engine
 //! let mut engine = Rpte::new("USDT", 4);
@@ -31,18 +31,19 @@
 //! engine.issue(alice, btc, 10u64).unwrap();
 //!
 //! // Create a limit buy order
-//! engine.make(alice, usdt, btc, 5000u64, 50000u64);
+//! engine.make(alice, 5000u64, 50000u64, Route::auto(usdt, btc));
 //! engine.step(); // Drive one frame
 //!
 //! // Query balance
 //! let balance = engine.get_node_balance(alice, usdt).unwrap();
 //!
-//! // Query price with orientation info: (price, quote_token, base_token)
-//! let (price, quote, base) = engine.get_current_price(usdt, btc).unwrap();
+//! // Query price
+//! let prices = engine.get_current_price(Route::auto(usdt, btc)).unwrap();
+//! let (price, _quote, _base) = prices[0];
 //!
-//! // Query order book depth — direction auto-derived from src/dst tokens
-//! let depth = engine.get_order_book(usdt, btc, 0).unwrap();
-//! println!("Best price: {}, volume: {}", depth.price, depth.volume);
+//! // Query order book depth
+//! let depths = engine.get_order_book(Route::auto(usdt, btc), 0).unwrap();
+//! println!("Best price: {}, volume: {}", depths[0].price, depths[0].volume);
 //! ```
 //!
 //! ## Modules
