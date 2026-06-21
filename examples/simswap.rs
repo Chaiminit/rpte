@@ -73,6 +73,7 @@ impl RandomBotManager {
         let eps = Decimal::new(1, 6);
         let usdt_bal = rpte.get_node_balance(bot, self.usdt_token).unwrap_or(zero);
         let btc_bal  = rpte.get_node_balance(bot, self.btc_token).unwrap_or(zero);
+        let eth_bal  = rpte.get_node_balance(bot, self.eth_token).unwrap_or(zero);
         let ausdt_bal = rpte.get_node_balance(bot, self.ausdt_token).unwrap_or(zero);
         let abtc_bal = rpte.get_node_balance(bot, self.abtc_token).unwrap_or(zero);
         let dusdt_bal = rpte.get_node_balance(bot, self.dusdt_token).unwrap_or(zero);
@@ -95,6 +96,9 @@ impl RandomBotManager {
             if dbtc_bal < -eps {
                 for _ in 0..1 { routes.push((self.btc_token, self.dbtc_token, true)); } // 还 BTC
             }
+        }
+        if eth_bal > eps {
+            for _ in 0..6 { routes.push((self.eth_token, self.usdt_token, false)); } // 卖 ETH
         }
 
         // ── 合约交互路线（低权重，~10%） ──
