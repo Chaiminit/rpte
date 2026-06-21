@@ -29,6 +29,7 @@ pub struct RandomBotManager {
     // token IDs
     usdt_token: usize,
     btc_token: usize,
+    eth_token: usize,
     ausdt_token: usize,
     abtc_token: usize,
     dusdt_token: usize,
@@ -43,6 +44,7 @@ impl RandomBotManager {
             max_order_ratio: 10,
             usdt_token: 0,
             btc_token: 0,
+            eth_token: 0,
             ausdt_token: 0,
             abtc_token: 0,
             dusdt_token: 0,
@@ -50,9 +52,10 @@ impl RandomBotManager {
         }
     }
 
-    pub fn set_lending_tokens(&mut self, usdt: usize, btc: usize, ausdt: usize, abtc: usize, dusdt: usize, dbtc: usize) {
+    pub fn set_lending_tokens(&mut self, usdt: usize, btc: usize, eth: usize, ausdt: usize, abtc: usize, dusdt: usize, dbtc: usize) {
         self.usdt_token = usdt;
         self.btc_token = btc;
+        self.eth_token = eth;
         self.ausdt_token = ausdt;
         self.abtc_token = abtc;
         self.dusdt_token = dusdt;
@@ -81,6 +84,8 @@ impl RandomBotManager {
         // 每个符合条件的路线重复 9 次，提高选中概率
         if usdt_bal > eps {
             for _ in 0..9 { routes.push((self.usdt_token, self.btc_token, false)); }
+            // ETH 交易
+            for _ in 0..6 { routes.push((self.usdt_token, self.eth_token, false)); }
             if dusdt_bal < -eps {
                 for _ in 0..1 { routes.push((self.usdt_token, self.dusdt_token, true)); } // 还款
             }
@@ -197,11 +202,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let btc_token = rpte.register_token("BTC");
     let usdt_token = rpte.get_token_by_name("USDT").unwrap();
+    let eth_token = rpte.register_token("ETH");
 
     for _i in 0..400 {
         let account = rpte.register_account();
         let _ = rpte.issue(account, usdt_token, 100000000u64);
         let _ = rpte.issue(account, btc_token, 1000u64);
+        let _ = rpte.issue(account, eth_token, 4000000u64);
         bot_manager.add_bot(account);
     }
 
@@ -229,7 +236,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let abtc_token = rpte.get_token_by_name("aBTC").unwrap();
     let dusdt_token = rpte.get_token_by_name("dUSDT").unwrap();
     let dbtc_token = rpte.get_token_by_name("dBTC").unwrap();
-    bot_manager.set_lending_tokens(usdt_token, btc_token, ausdt_token, abtc_token, dusdt_token, dbtc_token);
+    bot_manager.set_lending_tokens(usdt_token, btc_token, eth_token, ausdt_token, abtc_token, dusdt_token, dbtc_token);
+
+    // ── 触发创建 USDT↔ETH 交易对 ──
+    let _ = rpte.get_current_price(rpte::Route::auto(usdt_token, eth_token)).unwrap();
+    rpte.step();
 
     // ── 给 USDT-BTC 交易对设手续费，收给 player ──
     use rpte::taker_maker_fee;
