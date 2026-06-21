@@ -327,12 +327,4 @@ pub enum Msg {
         pair_id: usize,
         fee_fn: Option<FeeFn>,
     },
-    /// 快速兑换：按发现的路由逐跳自动兑换
-    FastSwap {
-        src_id: usize,
-        route: Route,
-        volume: Decimal,
-        /// 当前正在处理的跳数
-        current_hop: usize,
-    },
 }

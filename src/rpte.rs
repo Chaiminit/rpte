@@ -619,17 +619,23 @@ impl Rpte {
         });
     }
 
-    /// 创建市价单
+    /// 创建市价单（若 route 未解析，自动选最优路径）
     pub fn swap(&mut self, src_id: usize, volume: impl Into<Decimal>, route: Route) {
         let volume = self.round(volume.into());
+        // 如果 route 未解析（auto 且无路径），自动选路
+        let resolved_route = if !route.is_resolved() {
+            self.auto_select_best_route(route.src_token, route.dst_token, volume).unwrap_or(route)
+        } else {
+            route
+        };
         self.msgs.push(Msg::SwapOrder {
             src_id,
             owner_node_id: src_id,
-            src_token: route.src_token,
-            dst_token: route.dst_token,
+            src_token: resolved_route.src_token,
+            dst_token: resolved_route.dst_token,
             volume,
-            pair_id: route.pair_id,
-            route: Some(route),
+            pair_id: resolved_route.pair_id,
+            route: Some(resolved_route),
             current_hop: 0,
         });
     }
@@ -1458,33 +1464,6 @@ impl Rpte {
                             .entry((pair_node_id, direction))
                             .or_default()
                             .push((owner_node_id, volume, route, current_hop));
-                    }
-                    Msg::FastSwap { src_id, route, volume, current_hop } => {
-                        // 处理 FastSwap：逐跳处理
-                        if current_hop >= route.hops.len() {
-                            continue;
-                        }
-                        let hop = &route.hops[current_hop];
-                        // 推送该跳的 SwapOrder
-                        all_msgs.push(Msg::SwapOrder {
-                            src_id,
-                            owner_node_id: src_id,
-                            src_token: hop.src_token,
-                            dst_token: hop.dst_token,
-                            volume,
-                            pair_id: Some(hop.pair_id),
-                            route: Some(route.clone()),
-                            current_hop,
-                        });
-                        // 若还有后续跳，推送下一个 FastSwap
-                        if current_hop + 1 < route.hops.len() {
-                            all_msgs.push(Msg::FastSwap {
-                                src_id,
-                                route: route.clone(),
-                                volume,
-                                current_hop: current_hop + 1,
-                            });
-                        }
                     }
                     Msg::CreateContract { owner_node_id, name, on_create, on_update, on_end, on_called } => {
                         let step = self.step_count;
