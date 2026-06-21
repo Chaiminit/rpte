@@ -1008,3 +1008,61 @@ fn test_multi_hop_swap_via_quote() {
 
     // maker 也得到了成交（余额会相应变化）
 }
+
+// ============================
+// 三跳路由测试
+// ============================
+
+#[test]
+fn test_multi_hop_swap_three_hops() {
+    // 三跳路由：SOL→BTC→USDT→ETH
+    // 有 SOL↔BTC、USDT↔BTC、USDT↔ETH，无 SOL↔ETH、SOL↔USDT
+    let mut engine = Rpte::new("USDT", 5);
+    let usdt = engine.get_token_by_name("USDT").unwrap();
+    let btc = engine.register_token("BTC");
+    let eth = engine.register_token("ETH");
+    let sol = engine.register_token("SOL");
+
+    // maker1: 买 SOL（花 BTC，收 SOL）→ BUY on SOL↔BTC
+    let maker1 = engine.register_account();
+    engine.issue(maker1, btc, Decimal::new(10, 0)).unwrap();
+    engine.make(maker1, Decimal::new(10, 0), Decimal::new(150, 0), Route::auto(btc, sol));
+    engine.step();
+    engine.step();
+
+    // maker2: 买 BTC（花 USDT，收 BTC）→ BUY on USDT↔BTC
+    let maker2 = engine.register_account();
+    engine.issue(maker2, usdt, Decimal::new(500_000, 0)).unwrap();
+    engine.make(maker2, Decimal::new(500_000, 0), Decimal::new(50000, 0), Route::auto(usdt, btc));
+    engine.step();
+    engine.step();
+
+    // maker3: 卖 ETH（花 ETH，收 USDT）→ SELL on USDT↔ETH
+    let maker3 = engine.register_account();
+    engine.issue(maker3, eth, Decimal::new(200, 0)).unwrap();
+    engine.make(maker3, Decimal::new(200, 0), Decimal::new(3000, 0), Route::auto(eth, usdt));
+    engine.step();
+    engine.step();
+
+    // 验证：无直接 SOL↔ETH 交易对
+    let pairs = engine.get_all_pairs_info();
+    let has_direct = pairs.iter().any(|(_, q, b, _)| {
+        (*q == sol && *b == eth) || (*q == eth && *b == sol)
+    });
+    assert!(!has_direct, "there should be NO direct SOL-ETH pair");
+
+    // bot: 持有 SOL，想换成 ETH
+    let bot = engine.register_account();
+    engine.issue(bot, sol, Decimal::new(100, 0)).unwrap();
+
+    // BFS 应发现 3 跳路径 SOL→BTC→USDT→ETH
+    engine.swap(bot, Decimal::new(100, 0), Route::auto(sol, eth));
+    for _ in 0..10 {
+        engine.step();
+    }
+
+    let bot_sol = engine.get_node_balance(bot, sol).unwrap();
+    assert!(bot_sol < Decimal::new(100, 0), "bot should have spent SOL, got {}", bot_sol);
+    let bot_eth = engine.get_node_balance(bot, eth).unwrap();
+    assert!(bot_eth > Decimal::ZERO, "bot should have received ETH, got {}", bot_eth);
+}

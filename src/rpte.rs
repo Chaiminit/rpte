@@ -749,53 +749,53 @@ impl Rpte {
         if src_token == dst_token {
             return vec![];
         }
-        let mut routes: Vec<Route> = Vec::new();
         let quote = self.global_quote_token;
         let pairs = self.get_all_pairs_info();
 
-        // 辅助：检查是否存在 (q, b) 交易对
-        let has_pair = |q: usize, b: usize| -> bool {
-            pairs.iter().any(|&(_, pq, pb, _)| (pq == q && pb == b) || (pq == b && pb == q))
-        };
-
-        // 1. 直连路径
-        if has_pair(src_token, dst_token) {
-            routes.push(Route::auto(src_token, dst_token));
+        // 构建邻接表：token → [(pair_id, neighbor_token)]
+        let mut adj: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+        for &(pid, q, b, _) in &pairs {
+            adj.entry(q).or_default().push((pid, b));
+            adj.entry(b).or_default().push((pid, q));
         }
 
-        // 2. 经全局 quote token 的 2 跳路径：src→quote→dst
-        if src_token != quote && dst_token != quote {
-            if has_pair(src_token, quote) && has_pair(quote, dst_token) {
-                let hops = vec![
-                    RouteHop { pair_id: 0, src_token, dst_token: quote },
-                    RouteHop { pair_id: 0, dst_token, src_token: quote },
-                ];
-                routes.push(Route::via(src_token, dst_token, hops));
-            }
-        }
+        // BFS 发现所有无环路径（最多探索至总 token 数 - 1 跳，天然防环）
+        let max_hops = adj.len().saturating_sub(1);
+        let mut routes: Vec<Route> = Vec::new();
+        let mut queue: Vec<(usize, Vec<RouteHop>)> = Vec::new();
+        queue.push((src_token, vec![]));
 
-        // 3. 经任意中间 token 的 2 跳路径：src→mid→dst（mid ≠ quote）
-        let all_tokens: Vec<usize> = self.token_id_to_name.keys().copied().collect();
-        for &mid in &all_tokens {
-            if mid == src_token || mid == dst_token || mid == quote {
-                continue;
-            }
-            if has_pair(src_token, mid) && has_pair(mid, dst_token) {
-                // 避免重复（已有相同的推）
-                let already = routes.iter().any(|r| {
-                    r.hops.len() == 2
-                        && r.hops[0].dst_token == mid
-                        && r.hops[1].src_token == mid
-                });
-                if !already {
-                    let hops = vec![
-                        RouteHop { pair_id: 0, src_token, dst_token: mid },
-                        RouteHop { pair_id: 0, src_token: mid, dst_token },
-                    ];
-                    routes.push(Route::via(src_token, dst_token, hops));
+        while let Some((current, path)) = queue.pop() {
+            if let Some(neighbors) = adj.get(&current) {
+                for &(pid, next) in neighbors {
+                    // 防环
+                    if path.iter().any(|h| h.dst_token == next) || next == src_token {
+                        continue;
+                    }
+                    let hop = RouteHop {
+                        pair_id: pid,
+                        src_token: current,
+                        dst_token: next,
+                    };
+                    let mut new_path = path.clone();
+                    new_path.push(hop);
+
+                    if next == dst_token {
+                        // 找到一条完整路径
+                        routes.push(Route::via(src_token, dst_token, new_path));
+                    } else if new_path.len() < max_hops {
+                        queue.push((next, new_path));
+                    }
                 }
             }
         }
+
+        // 去重：同样跳数的等价路径只保留一条
+        routes.sort_by_key(|r| r.hops.len());
+        routes.dedup_by_key(|r| {
+            r.hops.iter().map(|h| (h.src_token, h.dst_token)).collect::<Vec<_>>()
+        });
 
         routes
     }
